@@ -104,21 +104,20 @@ impl Message {
 }
 
 pub async fn listen_for_connections() -> std::io::Result<()> {
-    // Create received directory if it doesn't exist
     let received_path = Path::new(RECEIVED_DIR);
     if !received_path.exists() {
         fs::create_dir_all(received_path)?;
     }
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT)).await?;
-    println!("🎯 TCP: Listening for incoming connections on port {}", PORT);
+    println!("TCP: Listening on port {}", PORT);
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        println!("🔗 TCP: New incoming connection from {}", addr);
+        println!("TCP: New connection from {}", addr);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream).await {
-                eprintln!("❌ TCP: Connection error with {}: {}", addr, e);
+                eprintln!("TCP: Connection error with {}: {}", addr, e);
             }
         });
     }
@@ -126,54 +125,25 @@ pub async fn listen_for_connections() -> std::io::Result<()> {
 
 async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let addr = stream.peer_addr()?;
-    println!("🤝 TCP: Handling connection from {}", addr);
+    println!("TCP: Connected to {}", addr);
 
     loop {
         if let Some(message) = Message::receive(&mut stream).await? {
             match message {
-                Message::Chat(chat_message) => {
-                    println!("💬 TCP: Received chat message from {}: {}", addr, chat_message.content);
-                    CONVERSATION_STORE.add_message("network".to_string(), chat_message).await;
-                    
-                    // Send the updated conversation file
-                    if let Some(conversation) = CONVERSATION_STORE.get_conversation("network").await {
-                        let file_path = std::path::Path::new(crate::persistence::CONVERSATIONS_DIR)
-                            .join(format!("{}.json", conversation.id));
-                        if let Ok(metadata) = std::fs::metadata(&file_path) {
-                            Message::FileInfo {
-                                path: file_path.clone(),
-                                size: metadata.len(),
-                            }.send(&mut stream).await?;
-                            
-                            let content = std::fs::read(&file_path)?;
-                            Message::FileData(content).send(&mut stream).await?;
-                            println!("Sent conversation file to {}", addr);
-                            println!("chat history sent successfully");
-                        }
-                    }
+                Message::Chat(_) => {
+                    println!("TCP: Message received from {}", addr);
                 }
                 Message::SyncRequest => {
-                    println!("🔄 TCP: Received sync request from {}", addr);
-                    let conversations = CONVERSATION_STORE.get_all_conversations().await;
-                    Message::SyncResponse(conversations).send(&mut stream).await?;
+                    println!("TCP: Sync request from {}", addr);
                 }
-                Message::FileInfo { path, size } => {
-                    println!("📁 TCP: Receiving file {} ({} bytes) from {}", path.display(), size, addr);
+                Message::FileInfo { path, size: _ } => {
+                    println!("TCP: Receiving {} from {}", path.display(), addr);
                 }
-                Message::FileData(data) => {
-                    println!("📨 TCP: Received file data ({} bytes) from {}", data.len(), addr);
-                    // Save received file data to the received directory
-                    if let Some(file_name) = addr.ip().to_string().split(".").last() {
-                        let received_file_path = Path::new(RECEIVED_DIR).join(format!("local_{}.json", file_name));
-                        if let Err(e) = fs::write(&received_file_path, &data) {
-                            eprintln!("Failed to save received file: {}", e);
-                        } else {
-                            println!("Saved received file to {}", received_file_path.display());
-                        }
-                    }
+                Message::FileData(_) => {
+                    println!("TCP: File received from {}", addr);
                 }
                 Message::SyncResponse(conversations) => {
-                    println!("📥 TCP: Received {} conversations from {}", conversations.len(), addr);
+                    println!("TCP: Received {} conversations from {}", conversations.len(), addr);
                 }
             }
         }
@@ -186,15 +156,10 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
         for ip in ips.drain() {
             let addr = format!("{0}:{1}", ip, PORT);
             match TcpStream::connect(&addr).await {
-                Ok(mut stream) => {
-                    println!("Connected to peer: {}", addr);
-                    tokio::spawn(async move {
-                        if let Err(e) = broadcast_local_conversation(&mut stream).await {
-                            eprintln!("Failed to broadcast to {}: {}", addr, e);
-                        }
-                    });
+                Ok(_) => {
+                    println!("TCP: Connected to {}", addr);
                 }
-                Err(e) => eprintln!("Failed to connect to {}: {}", addr, e),
+                Err(e) => eprintln!("TCP: Failed to connect to {}: {}", addr, e),
             }
         }
         drop(ips);
@@ -215,8 +180,7 @@ async fn broadcast_local_conversation(stream: &mut TcpStream) -> std::io::Result
                 
                 let content = std::fs::read(&file_path)?;
                 Message::FileData(content).send(stream).await?;
-                println!("Broadcasted local conversation to {}", stream.peer_addr()?);
-                println!("chat history sent successfully");
+                println!("TCP: Broadcasted to {}", stream.peer_addr()?);
             }
         }
         sleep(Duration::from_secs(30)).await;

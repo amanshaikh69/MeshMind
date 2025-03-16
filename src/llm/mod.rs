@@ -13,51 +13,115 @@ pub struct ChatRequest {
     sender: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct OllamaRequest {
-    model: String,
-    prompt: String,
-    stream: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct OllamaResponse {
-    model: String,
-    created_at: String,
-    message: OllamaMessage,
-    done: bool,
-}
-
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct OllamaMessage {
     role: String,
     content: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct OllamaRequest {
+    model: String,
+    messages: Vec<OllamaMessage>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct OllamaResponse {
+    model: String,
+    created_at: String,
+    message: OllamaMessage,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<Vec<i32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_duration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_duration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_eval_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eval_duration: Option<i64>,
+}
+
 #[post("/chat")]
 pub async fn chat(req: web::Json<ChatRequest>) -> Result<HttpResponse, Error> {
     let client = Client::new();
-    
     let ollama_req = OllamaRequest {
-        model: "qwen2.5-coder7b".to_string(),
-        prompt: req.message.clone(),
-        stream: false,
+        model: "qwen2.5-coder:7b".to_string(),
+        messages: vec![
+            OllamaMessage {
+                role: "user".to_string(),
+                content: req.message.clone(),
+            }
+        ],
     };
-
-    let response = client
+    
+    let response = match client
         .post(format!("{}/api/chat", OLLAMA_HOST))
         .json(&ollama_req)
         .send()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+        .await {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!("Error: Failed to connect to LLM server: {}", e);
+                return Ok(HttpResponse::ServiceUnavailable()
+                    .json(serde_json::json!({
+                        "error": "Failed to connect to LLM server",
+                        "details": format!("Connection error: {}. Please ensure Ollama is running on {}", e, OLLAMA_HOST)
+                    })));
+            }
+        };
 
-    let ollama_response = response
-        .json::<OllamaResponse>()
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+    if !response.status().is_success() {
+        eprintln!("Error: LLM server returned status: {}", response.status());
+        return Ok(HttpResponse::BadGateway()
+            .json(serde_json::json!({
+                "error": "LLM server error",
+                "status": response.status().as_u16(),
+                "details": format!("Server returned: {}", response.status())
+            })));
+    }
+    
+    let mut full_response = String::new();
+    let body = response.text().await.map_err(|e| {
+        eprintln!("Error: Failed to get LLM response: {}", e);
+        actix_web::error::ErrorInternalServerError(e)
+    })?;
+
+    let mut response_complete = false;
+    for line in body.lines() {
+        if let Ok(resp) = serde_json::from_str::<OllamaResponse>(line) {
+            full_response.push_str(&resp.message.content);
+            if resp.done {
+                response_complete = true;
+            }
+        }
+    }
+
+    if !response_complete {
+        eprintln!("Error: Incomplete response from LLM");
+        return Ok(HttpResponse::InternalServerError()
+            .json(serde_json::json!({
+                "error": "Incomplete response from LLM",
+                "details": "The model response stream ended unexpectedly"
+            })));
+    }
+
+    if full_response.trim().is_empty() {
+        eprintln!("Error: Empty response from LLM");
+        return Ok(HttpResponse::InternalServerError()
+            .json(serde_json::json!({
+                "error": "Empty response from LLM",
+                "details": "The model returned an empty response. This might indicate an issue with the model loading or processing."
+            })));
+    }
 
     let chat_message = ChatMessage {
-        content: ollama_response.message.content,
+        content: full_response,
         timestamp: Utc::now(),
         sender: req.sender.clone(),
     };

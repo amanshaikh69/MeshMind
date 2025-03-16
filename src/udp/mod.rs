@@ -11,20 +11,18 @@ use crate::ip::is_my_ip;
 
 const BROADCAST_PORT: u16 = 5000;
 const ONLINE_MESSAGE: &str = "ONLINE";
-const BROADCAST_INTERVAL: Duration = Duration::from_secs(60);
+const BROADCAST_INTERVAL: Duration = Duration::from_secs(30);
 const LISTEN_ADDR: &str = "0.0.0.0:5000";
 
 async fn send_broadcast(broadcast_addr: String) -> Result<(), std::io::Error> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
-
-    println!("📢 UDP: Broadcasting to network: {}", broadcast_addr);
+    println!("UDP: Broadcasting to {}", broadcast_addr);
     socket.send_to(ONLINE_MESSAGE.as_bytes(), broadcast_addr).await?;
     Ok(())
 }
 
 pub async fn periodic_broadcast() {
-    println!("📡 UDP: Starting periodic broadcast service");
     let mut interval = interval(BROADCAST_INTERVAL);
     loop {
         interval.tick().await;
@@ -45,7 +43,7 @@ pub async fn periodic_broadcast() {
                             if let Some(broadcast_addr) = subnet_mask {
                                 let broadcast_addr = format!("{}:{}", broadcast_addr, BROADCAST_PORT);
                                 if let Err(e) = send_broadcast(broadcast_addr).await {
-                                    eprintln!("❌ UDP: Broadcast error: {}", e);
+                                    eprintln!("UDP: Broadcast error: {}", e);
                                 }
                             }
                         }
@@ -57,20 +55,16 @@ pub async fn periodic_broadcast() {
 }
 
 pub async fn receive_broadcast(received_ips: Arc<Mutex<HashSet<String>>>) -> Result<(), std::io::Error> {
-    println!("👂 UDP: Starting broadcast receiver on {}", LISTEN_ADDR);
+    println!("UDP: Listening on {}", LISTEN_ADDR);
     let socket = UdpSocket::bind(LISTEN_ADDR).await?;
     let mut buf = [0; 1024];
 
     loop {
-        let (amt, src) = socket.recv_from(&mut buf).await?;
-        let received_message = str::from_utf8(&buf[..amt]).unwrap_or_default();
-        if received_message == ONLINE_MESSAGE {
-            let mut ips = received_ips.lock().await;
-            println!("📥 UDP: Received broadcast from: {}", src.ip());
-            if !is_my_ip(&src.ip().to_string()) {
-                ips.insert(src.ip().to_string());
-                println!("✅ UDP: Added new peer: {}", src.ip());
-            }
+        let (_, src) = socket.recv_from(&mut buf).await?;
+        let mut ips = received_ips.lock().await;
+        if !is_my_ip(&src.ip().to_string()) {
+            ips.insert(src.ip().to_string());
+            println!("UDP: Discovered peer {}", src.ip());
         }
     }
 }
