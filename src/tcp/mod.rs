@@ -9,10 +9,13 @@ use std::collections::HashSet;
 use tokio::fs;
 use crate::conversation::{ChatMessage, Conversation, CONVERSATION_STORE};
 use crate::persistence::CONVERSATIONS_DIR;
+use lazy_static::lazy_static;
+use reqwest::Client;
 
 const RECEIVED_DIR: &str = "received";
 const PORT: i32 = 7878;
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+const OLLAMA_CHECK_URL: &str = "http://127.0.0.1:11434/api/tags";
 
 #[derive(Debug)]
 enum Message {
@@ -22,6 +25,9 @@ enum Message {
     },
     SyncRequest,
     SyncResponse(Vec<Conversation>),
+    LLMCapability {
+        has_llm: bool,
+    },
 }
 
 impl Message {
@@ -42,6 +48,13 @@ impl Message {
             Message::SyncResponse(conversations) => {
                 stream.write_all(b"RESP:").await?;
                 let data = serde_json::to_string(conversations)?;
+                let len = data.len() as u64;
+                stream.write_all(&len.to_le_bytes()).await?;
+                stream.write_all(data.as_bytes()).await?;
+            }
+            Message::LLMCapability { has_llm } => {
+                stream.write_all(b"LLMC:").await?;
+                let data = has_llm.to_string();
                 let len = data.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
@@ -81,8 +94,32 @@ impl Message {
                 let conversations = serde_json::from_slice(&data)?;
                 Ok(Some(Message::SyncResponse(conversations)))
             }
+            b"LLMC:" => {
+                let has_llm = String::from_utf8_lossy(&data).parse::<bool>().unwrap_or(false);
+                Ok(Some(Message::LLMCapability { has_llm }))
+            }
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown message type")),
         }
+    }
+}
+
+// Store LLM-capable peers
+lazy_static! {
+    static ref LLM_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+}
+
+// Check if Ollama is running
+async fn is_ollama_available() -> bool {
+    if let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build() 
+    {
+        match client.get(OLLAMA_CHECK_URL).send().await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    } else {
+        false
     }
 }
 
@@ -111,6 +148,20 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let addr = stream.peer_addr()?;
     println!("TCP: Connected to {}", addr);
 
+    // Check Ollama availability before sending capability
+    let has_llm = is_ollama_available().await;
+    
+    // Send our LLM capability immediately
+    if let Err(e) = (Message::LLMCapability { has_llm }).send(&mut stream).await {
+        return Err(e);
+    }
+
+    if has_llm {
+        println!("TCP: Announced LLM capability to {}", addr);
+    } else {
+        println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
+    }
+
     loop {
         if let Some(message) = Message::receive(&mut stream).await? {
             match message {
@@ -121,7 +172,6 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                 }
                 Message::SyncRequest => {
                     println!("TCP: Sync request from {}", addr);
-                    // Send all local conversations
                     let conversations = CONVERSATION_STORE.get_all_conversations().await;
                     Message::SyncResponse(conversations).send(&mut stream).await?;
                 }
@@ -133,6 +183,17 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                         let file_path = Path::new(RECEIVED_DIR).join(&file_name);
                         fs::write(&file_path, json).await?;
                         println!("TCP: Saved conversation file {} from {}", file_name, addr);
+                    }
+                }
+                Message::LLMCapability { has_llm } => {
+                    if has_llm {
+                        let mut llm_peers = LLM_PEERS.lock().await;
+                        llm_peers.insert(addr.ip().to_string());
+                        println!("TCP: Peer {} has LLM capability", addr);
+                    } else {
+                        let mut llm_peers = LLM_PEERS.lock().await;
+                        llm_peers.remove(&addr.ip().to_string());
+                        println!("TCP: Peer {} does not have LLM capability", addr);
                     }
                 }
             }
@@ -148,6 +209,22 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
             match TcpStream::connect(&addr).await {
                 Ok(mut stream) => {
                     println!("TCP: Connected to {}", addr);
+                    
+                    // Check Ollama availability before sending capability
+                    let has_llm = is_ollama_available().await;
+                    
+                    // Send our LLM capability
+                    if let Err(e) = (Message::LLMCapability { has_llm }).send(&mut stream).await {
+                        eprintln!("TCP: Failed to send LLM capability to {}: {}", addr, e);
+                        continue;
+                    }
+
+                    if has_llm {
+                        println!("TCP: Announced LLM capability to {}", addr);
+                    } else {
+                        println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
+                    }
+
                     // Send local conversations
                     if let Ok(entries) = fs::read_dir(CONVERSATIONS_DIR).await {
                         let mut entries = entries;
@@ -174,4 +251,4 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
         drop(ips);
         sleep(SYNC_INTERVAL).await;
     }
-}
+} 

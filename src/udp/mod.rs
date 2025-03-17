@@ -6,6 +6,8 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use ipconfig::get_adapters;
 use std::net::{IpAddr, Ipv4Addr};
+use serde::{Serialize, Deserialize};
+use reqwest::Client;
 
 use crate::ip::is_my_ip;
 
@@ -13,12 +15,45 @@ const BROADCAST_PORT: u16 = 5000;
 const ONLINE_MESSAGE: &str = "ONLINE";
 const BROADCAST_INTERVAL: Duration = Duration::from_secs(30);
 const LISTEN_ADDR: &str = "0.0.0.0:5000";
+const OLLAMA_CHECK_URL: &str = "http://127.0.0.1:11434/api/tags";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BroadcastMessage {
+    message_type: String,
+    has_llm: bool,
+}
+
+// Check if Ollama is running
+async fn is_ollama_available() -> bool {
+    if let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build() 
+    {
+        match client.get(OLLAMA_CHECK_URL).send().await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    }
+}
 
 async fn send_broadcast(broadcast_addr: String) -> Result<(), std::io::Error> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.set_broadcast(true)?;
-    println!("UDP: Broadcasting to {}", broadcast_addr);
-    socket.send_to(ONLINE_MESSAGE.as_bytes(), broadcast_addr).await?;
+    
+    let has_llm = is_ollama_available().await;
+    let message = BroadcastMessage {
+        message_type: "ONLINE".to_string(),
+        has_llm,
+    };
+    
+    let message_bytes = serde_json::to_string(&message)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .into_bytes();
+    
+    println!("UDP: Broadcasting to {} (LLM available: {})", broadcast_addr, has_llm);
+    socket.send_to(&message_bytes, broadcast_addr).await?;
     Ok(())
 }
 
@@ -60,11 +95,15 @@ pub async fn receive_broadcast(received_ips: Arc<Mutex<HashSet<String>>>) -> Res
     let mut buf = [0; 1024];
 
     loop {
-        let (_, src) = socket.recv_from(&mut buf).await?;
-        let mut ips = received_ips.lock().await;
-        if !is_my_ip(&src.ip().to_string()) {
-            ips.insert(src.ip().to_string());
-            println!("UDP: Discovered peer {}", src.ip());
+        let (size, src) = socket.recv_from(&mut buf).await?;
+        if let Ok(message_str) = String::from_utf8(buf[..size].to_vec()) {
+            if let Ok(broadcast_msg) = serde_json::from_str::<BroadcastMessage>(&message_str) {
+                let mut ips = received_ips.lock().await;
+                if !is_my_ip(&src.ip().to_string()) {
+                    ips.insert(src.ip().to_string());
+                    println!("UDP: Discovered peer {} (LLM available: {})", src.ip(), broadcast_msg.has_llm);
+                }
+            }
         }
     }
 }
