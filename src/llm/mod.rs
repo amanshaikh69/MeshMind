@@ -3,9 +3,10 @@ use actix_web::{post, web, HttpResponse, Error};
 use serde::{Deserialize, Serialize};
 use reqwest::Client;
 use chrono::Utc;
-use crate::conversation::{ChatMessage, CONVERSATION_STORE};
+use crate::conversation::{ChatMessage, CONVERSATION_STORE, HostInfo, MessageType};
 use crate::tcp::LLM_CONNECTIONS;
 use std::time::Duration;
+use hostname;
 
 // Remove the constant and make it a function that returns the correct URL
 async fn get_ollama_url() -> String {
@@ -166,6 +167,33 @@ fn process_ollama_response(body: &str) -> Result<String, String> {
 
 #[post("/chat")]
 pub async fn chat(req: web::Json<ChatRequest>) -> Result<HttpResponse, Error> {
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+    
+    let ip_address = std::net::TcpStream::connect("8.8.8.8:53")
+        .and_then(|s| s.local_addr())
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+
+    let host_info = HostInfo {
+        hostname: hostname.clone(),
+        ip_address: ip_address.clone(),
+        is_llm_host: is_local_ollama_available().await,
+    };
+
+    // Create user question message
+    let question_message = ChatMessage {
+        content: req.message.clone(),
+        timestamp: Utc::now(),
+        sender: req.sender.clone(),
+        message_type: MessageType::Question,
+        host_info: host_info.clone(),
+    };
+
+    // Save the question
+    CONVERSATION_STORE.add_message("local".to_string(), question_message).await;
+
     let ollama_req = OllamaRequest {
         model: "qwen2.5-coder:7b".to_string(),
         messages: vec![
@@ -211,13 +239,17 @@ pub async fn chat(req: web::Json<ChatRequest>) -> Result<HttpResponse, Error> {
         }
     };
 
-    let chat_message = ChatMessage {
-        content: response,
+    // Create response message with host info
+    let response_message = ChatMessage {
+        content: response.clone(),
         timestamp: Utc::now(),
-        sender: req.sender.clone(),
+        sender: "LLM".to_string(),
+        message_type: MessageType::Response,
+        host_info,
     };
 
-    CONVERSATION_STORE.add_message("local".to_string(), chat_message.clone()).await;
+    // Save the response
+    CONVERSATION_STORE.add_message("local".to_string(), response_message.clone()).await;
 
-    Ok(HttpResponse::Ok().json(chat_message))
+    Ok(HttpResponse::Ok().json(response_message))
 }

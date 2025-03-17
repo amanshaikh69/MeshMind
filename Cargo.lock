@@ -1131,6 +1131,7 @@ dependencies = [
  "ipconfig",
  "lazy_static",
  "mime_guess",
+ "once_cell",
  "open",
  "reqwest",
  "rusqlite",

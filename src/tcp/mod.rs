@@ -4,11 +4,10 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use std::sync::Arc;
 use std::time::Duration;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::collections::{HashSet, HashMap};
 use tokio::fs;
-use crate::conversation::{ChatMessage, Conversation, CONVERSATION_STORE};
-use crate::persistence::CONVERSATIONS_DIR;
+use crate::conversation::{Conversation, CONVERSATION_STORE};
 use lazy_static::lazy_static;
 use reqwest::Client;
 
@@ -46,17 +45,38 @@ lazy_static! {
     static ref LLM_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     static ref AUTHORIZED_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     pub static ref LLM_CONNECTIONS: Arc<Mutex<HashMap<String, (String, i32)>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref CONNECTED_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 }
 
 impl Message {
     async fn send(&self, stream: &mut TcpStream) -> std::io::Result<()> {
         match self {
             Message::ConversationFile { name, content } => {
+                // Send marker
                 stream.write_all(b"FILE:").await?;
+                
+                // Prepare the data with a clear separator
                 let data = format!("{}|{}", name, content);
                 let len = data.len() as u64;
-                stream.write_all(&len.to_le_bytes()).await?;
-                stream.write_all(data.as_bytes()).await?;
+                
+                // Send length and verify it was written
+                let len_bytes = len.to_le_bytes();
+                let bytes_written = stream.write(&len_bytes).await?;
+                if bytes_written != 8 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!("Failed to write complete length (wrote {} of 8 bytes)", bytes_written)
+                    ));
+                }
+                
+                // Send data and verify it was written
+                let bytes_written = stream.write(data.as_bytes()).await?;
+                if bytes_written != data.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!("Failed to write complete data (wrote {} of {} bytes)", bytes_written, data.len())
+                    ));
+                }
             }
             Message::SyncRequest => {
                 stream.write_all(b"SYNC:").await?;
@@ -100,16 +120,41 @@ impl Message {
 
     async fn receive(stream: &mut TcpStream) -> std::io::Result<Option<Message>> {
         let mut marker = [0u8; 5];
-        if let Ok(0) = stream.read_exact(&mut marker).await {
-            return Ok(None);
+        
+        // Read marker with proper error handling
+        match stream.read_exact(&mut marker).await {
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
         }
 
+        // Read length with verification
         let mut len_bytes = [0u8; 8];
-        stream.read_exact(&mut len_bytes).await?;
+        match stream.read_exact(&mut len_bytes).await {
+            Ok(_) => (),
+            Err(e) => {
+                eprintln!("TCP: Failed to read message length: {}", e);
+                return Err(e);
+            }
+        }
+        
         let len = u64::from_le_bytes(len_bytes) as usize;
+        if len > 1024 * 1024 * 10 { // 10MB limit
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Message too large: {} bytes", len)
+            ));
+        }
 
+        // Read data with verification
         let mut data = vec![0u8; len];
-        stream.read_exact(&mut data).await?;
+        match stream.read_exact(&mut data).await {
+            Ok(_) => (),
+            Err(e) => {
+                eprintln!("TCP: Failed to read message data: {}", e);
+                return Err(e);
+            }
+        }
 
         match &marker {
             b"FILE:" => {
@@ -166,8 +211,8 @@ impl Message {
     }
 }
 
-// Check if Ollama is running and accessible externally
-async fn is_ollama_available() -> bool {
+// Make the function public
+pub async fn is_ollama_available() -> bool {
     if let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(2))
         .build() 
@@ -230,9 +275,64 @@ pub async fn listen_for_connections() -> std::io::Result<()> {
     }
 }
 
+// Add this new function for periodic conversation sharing
+async fn periodic_conversation_share(mut stream: TcpStream, addr: std::net::SocketAddr) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    
+    loop {
+        interval.tick().await;
+        
+        // Check if we still have a valid connection
+        if let Err(_) = stream.write_all(&[0u8]).await {
+            println!("TCP: Lost connection to {} during periodic share", addr);
+            break;
+        }
+        
+        // Share our local conversation
+        if let Some(conversation) = CONVERSATION_STORE.get_local_conversation().await {
+            match serde_json::to_string(&conversation) {
+                Ok(content) => {
+                    let message = Message::ConversationFile {
+                        name: "local.json".to_string(),
+                        content,
+                    };
+                    
+                    match message.send(&mut stream).await {
+                        Ok(_) => println!("TCP: Periodic share - Sent local conversation to {}", addr),
+                        Err(e) => {
+                            eprintln!("TCP: Periodic share - Failed to send local conversation to {}: {}", addr, e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("TCP: Periodic share - Failed to serialize conversation: {}", e);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
 async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     let addr = stream.peer_addr()?;
     println!("TCP: Connected to {}", addr);
+
+    // Create received directory if it doesn't exist
+    let received_path = Path::new(RECEIVED_DIR);
+    if !received_path.exists() {
+        fs::create_dir_all(received_path).await?;
+    }
+
+    // Create a directory for this peer's conversations
+    let peer_dir = received_path.join(addr.ip().to_string());
+    if !peer_dir.exists() {
+        fs::create_dir_all(&peer_dir).await?;
+    }
+
+    // Get our local IP address for LLM access
+    let local_addr = stream.local_addr()?;
+    let local_ip = local_addr.ip().to_string();
 
     // Check Ollama availability before sending capability
     let has_llm = is_ollama_available().await;
@@ -248,14 +348,76 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
     }
 
-    // Get our local IP address for LLM access
-    let local_addr = stream.local_addr()?;
-    let local_ip = local_addr.ip().to_string();
+    // Share our local conversation immediately
+    if let Some(conversation) = CONVERSATION_STORE.get_local_conversation().await {
+        let content = serde_json::to_string(&conversation)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        
+        let message = Message::ConversationFile {
+            name: "local.json".to_string(),
+            content,
+        };
+        
+        if let Err(e) = message.send(&mut stream).await {
+            eprintln!("TCP: Failed to send local conversation to {}: {}", addr, e);
+        } else {
+            println!("TCP: Sent local conversation to {}", addr);
+        }
+    }
 
+    // Main message handling loop
     loop {
         match Message::receive(&mut stream).await {
             Ok(Some(message)) => {
                 match message {
+                    Message::ConversationFile { name, content } => {
+                        // Save the conversation in the peer's directory
+                        let file_path = peer_dir.join(&name);
+                        if let Err(e) = fs::write(&file_path, content.as_bytes()).await {
+                            eprintln!("TCP: Failed to save received file {}: {}", name, e);
+                        } else {
+                            println!("TCP: Received and saved conversation file {} from {}", name, addr);
+                            
+                            // Try to load the received conversation
+                            if let Ok(conversation) = serde_json::from_str::<Conversation>(&content) {
+                                CONVERSATION_STORE.add_peer_conversation(addr.ip().to_string(), conversation).await;
+                            }
+                        }
+                    }
+                    Message::LLMAccessRequest { peer_name, reason } => {
+                        if has_llm {
+                            println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
+                            
+                            // Include our IP and Ollama port in the response
+                            let response = Message::LLMAccessResponse {
+                                granted: true,
+                                message: "Access granted automatically".to_string(),
+                                llm_host: Some(local_ip.clone()),
+                                llm_port: Some(OLLAMA_PORT),
+                            };
+                            
+                            // Send response immediately and ensure it's sent
+                            if let Err(e) = response.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
+                                return Err(e);
+                            }
+
+                            let mut authorized = AUTHORIZED_PEERS.lock().await;
+                            authorized.insert(addr.ip().to_string());
+                            println!("TCP: Granted LLM access to {} ({}) with port {}", addr, peer_name, OLLAMA_PORT);
+                        } else {
+                            let response = Message::LLMAccessResponse {
+                                granted: false,
+                                message: "This peer does not have LLM capability".to_string(),
+                                llm_host: None,
+                                llm_port: None,
+                            };
+                            if let Err(e) = response.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
+                                return Err(e);
+                            }
+                        }
+                    }
                     Message::LLMCapability { has_llm } => {
                         let ip = addr.ip().to_string();
                         let mut llm_peers = LLM_PEERS.lock().await;
@@ -268,6 +430,8 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                             if !authorized.contains(&ip) {
                                 drop(authorized);
                                 drop(llm_peers);
+                                // Send request on a delay to avoid race conditions
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                                 if let Err(e) = request_llm_access(&mut stream, &addr.to_string()).await {
                                     eprintln!("TCP: Failed to request LLM access: {}", e);
                                 }
@@ -275,39 +439,6 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                         } else {
                             llm_peers.remove(&ip);
                             println!("TCP: Peer {} does not have LLM capability", addr);
-                        }
-                    }
-                    Message::LLMAccessRequest { peer_name, reason } => {
-                        if has_llm {
-                            println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
-                            
-                            // Include our IP and Ollama port in the response
-                            let response = Message::LLMAccessResponse {
-                                granted: true,
-                                message: "Access granted automatically".to_string(),
-                                llm_host: Some(local_ip.clone()),  // Use our actual IP address
-                                llm_port: Some(OLLAMA_PORT),
-                            };
-                            
-                            if let Err(e) = response.send(&mut stream).await {
-                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
-                                return Err(e);
-                            } else {
-                                let mut authorized = AUTHORIZED_PEERS.lock().await;
-                                authorized.insert(addr.ip().to_string());
-                                println!("TCP: Granted LLM access to {} ({}) with port {}", addr, peer_name, OLLAMA_PORT);
-                            }
-                        } else {
-                            let response = Message::LLMAccessResponse {
-                                granted: false,
-                                message: "This peer does not have LLM capability".to_string(),
-                                llm_host: None,
-                                llm_port: None,
-                            };
-                            if let Err(e) = response.send(&mut stream).await {
-                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
-                                return Err(e);
-                            }
                         }
                     }
                     Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
@@ -328,8 +459,9 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
                             println!("TCP: LLM access denied by {} - {}", addr, message);
                         }
                     }
-                    // Handle other message types...
-                    _ => {}
+                    _ => {
+                        println!("TCP: Received unexpected message type from {}", addr);
+                    }
                 }
             }
             Ok(None) => {
@@ -342,6 +474,7 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
             }
         }
     }
+
     Ok(())
 }
 
@@ -349,10 +482,41 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
     loop {
         let mut ips = received_ips.lock().await;
         for ip in ips.drain() {
+            // Skip if we're already connected to this peer
+            let mut connected = CONNECTED_PEERS.lock().await;
+            if connected.contains(&ip) {
+                println!("TCP: Already connected to {}, skipping", ip);
+                continue;
+            }
+            connected.insert(ip.clone());
+            drop(connected);
+            
             let addr = format!("{}:{}", ip, PORT);
             match TcpStream::connect(&addr).await {
                 Ok(mut stream) => {
                     println!("TCP: Connected to {}", addr);
+                    
+                    // Create received directory if it doesn't exist
+                    let received_path = Path::new(RECEIVED_DIR);
+                    if !received_path.exists() {
+                        if let Err(e) = fs::create_dir_all(received_path).await {
+                            eprintln!("TCP: Failed to create received directory: {}", e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    }
+
+                    // Create a directory for this peer's conversations
+                    let peer_dir = received_path.join(&ip);
+                    if !peer_dir.exists() {
+                        if let Err(e) = fs::create_dir_all(&peer_dir).await {
+                            eprintln!("TCP: Failed to create peer directory: {}", e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    }
                     
                     // Check Ollama availability before sending capability
                     let has_llm = is_ollama_available().await;
@@ -360,6 +524,8 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                     // Send our LLM capability
                     if let Err(e) = (Message::LLMCapability { has_llm }).send(&mut stream).await {
                         eprintln!("TCP: Failed to send LLM capability to {}: {}", addr, e);
+                        let mut connected = CONNECTED_PEERS.lock().await;
+                        connected.remove(&ip);
                         continue;
                     }
 
@@ -369,52 +535,196 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                         println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
                     }
 
-                    // Keep connection alive and handle messages
-                    loop {
-                        match Message::receive(&mut stream).await {
-                            Ok(Some(message)) => {
-                                match message {
-                                    Message::LLMCapability { has_llm } => {
-                                        let mut llm_peers = LLM_PEERS.lock().await;
-                                        if has_llm {
-                                            llm_peers.insert(ip.clone());
-                                            println!("TCP: Peer {} has LLM capability", addr);
-                                            
-                                            // Check if we need to request access
-                                            let authorized = AUTHORIZED_PEERS.lock().await;
-                                            if !authorized.contains(&ip) {
-                                                drop(authorized);
-                                                drop(llm_peers);
-                                                if let Err(e) = request_llm_access(&mut stream, &addr).await {
-                                                    eprintln!("TCP: Failed to request LLM access: {}", e);
-                                                    break;
+                    // Share our local conversation
+                    if let Some(conversation) = CONVERSATION_STORE.get_local_conversation().await {
+                        let content = match serde_json::to_string(&conversation) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                eprintln!("TCP: Failed to serialize conversation: {}", e);
+                                let mut connected = CONNECTED_PEERS.lock().await;
+                                connected.remove(&ip);
+                                continue;
+                            }
+                        };
+                        
+                        let message = Message::ConversationFile {
+                            name: "local.json".to_string(),
+                            content,
+                        };
+                        
+                        if let Err(e) = message.send(&mut stream).await {
+                            eprintln!("TCP: Failed to send local conversation to {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        } else {
+                            println!("TCP: Sent local conversation to {}", addr);
+                        }
+                    }
+
+                    // Set up periodic sharing
+                    match setup_periodic_sharing(stream, &addr, &ip).await {
+                        Ok((mut stream, share_handle)) => {
+                            // Keep connection alive and handle messages
+                            loop {
+                                match Message::receive(&mut stream).await {
+                                    Ok(Some(message)) => {
+                                        match message {
+                                            Message::ConversationFile { name, content } => {
+                                                // Save the conversation in the peer's directory
+                                                let file_path = peer_dir.join(&name);
+                                                if let Err(e) = fs::write(&file_path, content.as_bytes()).await {
+                                                    eprintln!("TCP: Failed to save received file {}: {}", name, e);
+                                                } else {
+                                                    println!("TCP: Received and saved conversation file {} from {}", name, addr);
+                                                    
+                                                    // Try to load the received conversation
+                                                    if let Ok(conversation) = serde_json::from_str::<Conversation>(&content) {
+                                                        CONVERSATION_STORE.add_peer_conversation(ip.clone(), conversation).await;
+                                                    }
                                                 }
                                             }
-                                        } else {
-                                            llm_peers.remove(&ip);
-                                            println!("TCP: Peer {} does not have LLM capability", addr);
+                                            Message::LLMCapability { has_llm } => {
+                                                let mut llm_peers = LLM_PEERS.lock().await;
+                                                if has_llm {
+                                                    llm_peers.insert(ip.clone());
+                                                    println!("TCP: Peer {} has LLM capability", addr);
+                                                    
+                                                    // Check if we need to request access
+                                                    let authorized = AUTHORIZED_PEERS.lock().await;
+                                                    if !authorized.contains(&ip) {
+                                                        drop(authorized);
+                                                        drop(llm_peers);
+                                                        if let Err(e) = request_llm_access(&mut stream, &addr).await {
+                                                            eprintln!("TCP: Failed to request LLM access: {}", e);
+                                                            break;
+                                                        }
+                                                    }
+                                                } else {
+                                                    llm_peers.remove(&ip);
+                                                    println!("TCP: Peer {} does not have LLM capability", addr);
+                                                }
+                                            }
+                                            Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
+                                                if granted {
+                                                    let mut authorized = AUTHORIZED_PEERS.lock().await;
+                                                    authorized.insert(ip.clone());
+                                                    
+                                                    // Store LLM connection details if provided
+                                                    if let (Some(host), Some(port)) = (llm_host.clone(), llm_port) {
+                                                        let mut connections = LLM_CONNECTIONS.lock().await;
+                                                        connections.insert(ip.clone(), (host.clone(), port));
+                                                        println!("TCP: LLM access granted by {} - {} (LLM available at {}:{})", 
+                                                               addr, message, host, port);
+                                                    } else {
+                                                        println!("TCP: LLM access granted by {} - {}", addr, message);
+                                                    }
+                                                } else {
+                                                    println!("TCP: LLM access denied by {} - {}", addr, message);
+                                                }
+                                            }
+                                            _ => continue,
                                         }
                                     }
-                                    _ => continue,
+                                    Ok(None) => {
+                                        println!("TCP: Connection closed by {}", addr);
+                                        let mut connected = CONNECTED_PEERS.lock().await;
+                                        connected.remove(&ip);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("TCP: Error reading from {}: {}", addr, e);
+                                        let mut connected = CONNECTED_PEERS.lock().await;
+                                        connected.remove(&ip);
+                                        break;
+                                    }
                                 }
                             }
-                            Ok(None) => {
-                                println!("TCP: Connection closed by {}", addr);
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("TCP: Error reading from {}: {}", addr, e);
-                                break;
-                            }
+
+                            // Cancel the periodic sharing task when the connection ends
+                            share_handle.abort();
+                        }
+                        Err(e) => {
+                            eprintln!("TCP: Failed to setup periodic sharing for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
                         }
                     }
                 }
-                Err(e) => eprintln!("TCP: Failed to connect to {}: {}", addr, e),
+                Err(e) => {
+                    eprintln!("TCP: Failed to connect to {}: {}", addr, e);
+                    let mut connected = CONNECTED_PEERS.lock().await;
+                    connected.remove(&ip);
+                }
             }
         }
         drop(ips);
         sleep(SYNC_INTERVAL).await;
     }
+}
+
+// Helper function to set up periodic sharing
+async fn setup_periodic_sharing(
+    stream: TcpStream,
+    addr: &str,
+    ip: &str,
+) -> std::io::Result<(TcpStream, tokio::task::JoinHandle<()>)> {
+    let socket = match stream.into_std() {
+        Ok(socket) => socket,
+        Err(e) => {
+            let mut connected = CONNECTED_PEERS.lock().await;
+            connected.remove(ip);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to get standard socket: {}", e)));
+        }
+    };
+
+    if let Err(e) = socket.set_nonblocking(true) {
+        let mut connected = CONNECTED_PEERS.lock().await;
+        connected.remove(ip);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to set nonblocking: {}", e)));
+    }
+
+    let share_socket = match socket.try_clone() {
+        Ok(socket) => socket,
+        Err(e) => {
+            let mut connected = CONNECTED_PEERS.lock().await;
+            connected.remove(ip);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to clone socket: {}", e)));
+        }
+    };
+
+    let stream = match TcpStream::from_std(socket) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let mut connected = CONNECTED_PEERS.lock().await;
+            connected.remove(ip);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create tokio stream: {}", e)));
+        }
+    };
+
+    let share_stream = match TcpStream::from_std(share_socket) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let mut connected = CONNECTED_PEERS.lock().await;
+            connected.remove(ip);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create share stream: {}", e)));
+        }
+    };
+
+    // Parse the address for periodic sharing
+    let socket_addr = match addr.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            let mut connected = CONNECTED_PEERS.lock().await;
+            connected.remove(ip);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to parse address: {}", e)));
+        }
+    };
+
+    // Spawn periodic conversation sharing task
+    let share_handle = tokio::spawn(periodic_conversation_share(share_stream, socket_addr));
+
+    Ok((stream, share_handle))
 }
 
 async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Result<bool> {
@@ -427,15 +737,42 @@ async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Resu
         reason: "Requesting access to LLM services".to_string(),
     };
 
-    request.send(stream).await?;
-    println!("TCP: Sent LLM access request to {}", addr);
+    println!("TCP: Sending LLM access request to {}", addr);
+    
+    // Send request with timeout
+    match tokio::time::timeout(Duration::from_secs(5), request.send(stream)).await {
+        Ok(Ok(_)) => println!("TCP: Successfully sent LLM access request to {}", addr),
+        Ok(Err(e)) => {
+            eprintln!("TCP: Failed to send LLM access request to {}: {}", addr, e);
+            return Err(e);
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timeout while sending LLM access request"
+            ));
+        }
+    }
 
-    // Wait for response with timeout
-    let timeout = Duration::from_secs(5);
-    let response = tokio::time::timeout(timeout, Message::receive(stream)).await;
-
-    match response {
-        Ok(Ok(Some(Message::LLMAccessResponse { granted, message, llm_host, llm_port }))) => {
+    // Wait for response with a single longer timeout
+    let timeout = Duration::from_secs(15);
+    
+    match tokio::time::timeout(timeout, async {
+        loop {
+            match Message::receive(stream).await? {
+                Some(Message::LLMAccessResponse { granted, message, llm_host, llm_port }) => {
+                    return Ok((granted, message, llm_host, llm_port));
+                }
+                Some(other) => {
+                    println!("TCP: Received unexpected message while waiting for LLM access response: {:?}", other);
+                    // Continue waiting for the correct response
+                    continue;
+                }
+                None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")),
+            }
+        }
+    }).await {
+        Ok(Ok((granted, message, llm_host, llm_port))) => {
             if granted {
                 println!("TCP: LLM access granted by {} - {}", addr, message);
                 let mut authorized = AUTHORIZED_PEERS.lock().await;
@@ -444,7 +781,8 @@ async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Resu
                 // Store LLM connection details if provided
                 if let (Some(host), Some(port)) = (llm_host, llm_port) {
                     let mut connections = LLM_CONNECTIONS.lock().await;
-                    connections.insert(addr.to_string(), (host, port));
+                    connections.insert(addr.to_string(), (host.clone(), port));
+                    println!("TCP: LLM connection details stored for {} ({}:{})", addr, host, port);
                 }
                 Ok(true)
             } else {
@@ -452,21 +790,16 @@ async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Resu
                 Ok(false)
             }
         }
-        Ok(Ok(None)) => {
-            println!("TCP: Connection closed while waiting for LLM access response from {}", addr);
-            Ok(false)
-        }
-        Ok(Ok(Some(_))) => {
-            println!("TCP: Unexpected message type received from {} while waiting for LLM access response", addr);
-            Ok(false)
-        }
         Ok(Err(e)) => {
             eprintln!("TCP: Error reading LLM access response from {}: {}", addr, e);
             Err(e)
         }
         Err(_) => {
-            println!("TCP: Timeout waiting for LLM access response from {}", addr);
-            Ok(false)
+            eprintln!("TCP: Timeout waiting for LLM access response from {}", addr);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timeout waiting for LLM access response"
+            ))
         }
     }
 } 
