@@ -45,7 +45,7 @@ enum Message {
 lazy_static! {
     static ref LLM_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     static ref AUTHORIZED_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    static ref LLM_CONNECTIONS: Arc<Mutex<HashMap<String, (String, i32)>>> = Arc::new(Mutex::new(HashMap::new()));
+    pub static ref LLM_CONNECTIONS: Arc<Mutex<HashMap<String, (String, i32)>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 impl Message {
@@ -166,15 +166,43 @@ impl Message {
     }
 }
 
-// Check if Ollama is running
+// Check if Ollama is running and accessible externally
 async fn is_ollama_available() -> bool {
     if let Ok(client) = Client::builder()
         .timeout(Duration::from_secs(2))
         .build() 
     {
-        match client.get(OLLAMA_CHECK_URL).send().await {
+        // First check if Ollama is running locally
+        let local_available = match client.get(OLLAMA_CHECK_URL).send().await {
             Ok(response) => response.status().is_success(),
             Err(_) => false,
+        };
+
+        if !local_available {
+            return false;
+        }
+
+        // Then check if it's accessible externally
+        let local_addr = match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", OLLAMA_PORT)).await {
+            Ok(stream) => stream.local_addr().ok(),
+            Err(_) => None,
+        };
+
+        if let Some(addr) = local_addr {
+            // Try to connect using the external IP
+            match tokio::net::TcpStream::connect(format!("{}:{}", addr.ip(), OLLAMA_PORT)).await {
+                Ok(_) => {
+                    println!("TCP: Ollama is accessible externally");
+                    true
+                },
+                Err(e) => {
+                    println!("TCP: Ollama is not accessible externally: {}", e);
+                    println!("TCP: Please configure Ollama to listen on 0.0.0.0 by setting OLLAMA_HOST=0.0.0.0 in the environment");
+                    false
+                }
+            }
+        } else {
+            false
         }
     } else {
         false
@@ -220,92 +248,101 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
     }
 
+    // Get our local IP address for LLM access
+    let local_addr = stream.local_addr()?;
+    let local_ip = local_addr.ip().to_string();
+
     loop {
-        if let Some(message) = Message::receive(&mut stream).await? {
-            match message {
-                Message::ConversationFile { name, content } => {
-                    let file_path = Path::new(RECEIVED_DIR).join(&name);
-                    fs::write(&file_path, content).await?;
-                    println!("TCP: Received conversation file {} from {}", name, addr);
-                }
-                Message::SyncRequest => {
-                    println!("TCP: Sync request from {}", addr);
-                    let conversations = CONVERSATION_STORE.get_all_conversations().await;
-                    Message::SyncResponse(conversations).send(&mut stream).await?;
-                }
-                Message::SyncResponse(conversations) => {
-                    println!("TCP: Received {} conversations from {}", conversations.len(), addr);
-                    for conversation in conversations {
-                        let json = serde_json::to_string_pretty(&conversation)?;
-                        let file_name = format!("{}.json", conversation.id);
-                        let file_path = Path::new(RECEIVED_DIR).join(&file_name);
-                        fs::write(&file_path, json).await?;
-                        println!("TCP: Saved conversation file {} from {}", file_name, addr);
-                    }
-                }
-                Message::LLMCapability { has_llm } => {
-                    if has_llm {
+        match Message::receive(&mut stream).await {
+            Ok(Some(message)) => {
+                match message {
+                    Message::LLMCapability { has_llm } => {
+                        let ip = addr.ip().to_string();
                         let mut llm_peers = LLM_PEERS.lock().await;
-                        llm_peers.insert(addr.ip().to_string());
-                        println!("TCP: Peer {} has LLM capability", addr);
-                    } else {
-                        let mut llm_peers = LLM_PEERS.lock().await;
-                        llm_peers.remove(&addr.ip().to_string());
-                        println!("TCP: Peer {} does not have LLM capability", addr);
-                    }
-                }
-                Message::LLMAccessRequest { peer_name, reason } => {
-                    if has_llm {
-                        println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
-                        
-                        // Include our IP and Ollama port in the response
-                        let response = Message::LLMAccessResponse {
-                            granted: true,
-                            message: "Access granted automatically".to_string(),
-                            llm_host: Some(addr.ip().to_string()),
-                            llm_port: Some(OLLAMA_PORT),
-                        };
-                        
-                        if let Err(e) = response.send(&mut stream).await {
-                            eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
+                        if has_llm {
+                            llm_peers.insert(ip.clone());
+                            println!("TCP: Peer {} has LLM capability", addr);
+                            
+                            // Check if we need to request access
+                            let authorized = AUTHORIZED_PEERS.lock().await;
+                            if !authorized.contains(&ip) {
+                                drop(authorized);
+                                drop(llm_peers);
+                                if let Err(e) = request_llm_access(&mut stream, &addr.to_string()).await {
+                                    eprintln!("TCP: Failed to request LLM access: {}", e);
+                                }
+                            }
                         } else {
+                            llm_peers.remove(&ip);
+                            println!("TCP: Peer {} does not have LLM capability", addr);
+                        }
+                    }
+                    Message::LLMAccessRequest { peer_name, reason } => {
+                        if has_llm {
+                            println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
+                            
+                            // Include our IP and Ollama port in the response
+                            let response = Message::LLMAccessResponse {
+                                granted: true,
+                                message: "Access granted automatically".to_string(),
+                                llm_host: Some(local_ip.clone()),  // Use our actual IP address
+                                llm_port: Some(OLLAMA_PORT),
+                            };
+                            
+                            if let Err(e) = response.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
+                                return Err(e);
+                            } else {
+                                let mut authorized = AUTHORIZED_PEERS.lock().await;
+                                authorized.insert(addr.ip().to_string());
+                                println!("TCP: Granted LLM access to {} ({}) with port {}", addr, peer_name, OLLAMA_PORT);
+                            }
+                        } else {
+                            let response = Message::LLMAccessResponse {
+                                granted: false,
+                                message: "This peer does not have LLM capability".to_string(),
+                                llm_host: None,
+                                llm_port: None,
+                            };
+                            if let Err(e) = response.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
+                        if granted {
                             let mut authorized = AUTHORIZED_PEERS.lock().await;
                             authorized.insert(addr.ip().to_string());
-                            println!("TCP: Granted LLM access to {} ({}) with port {}", addr, peer_name, OLLAMA_PORT);
-                        }
-                    } else {
-                        let response = Message::LLMAccessResponse {
-                            granted: false,
-                            message: "This peer does not have LLM capability".to_string(),
-                            llm_host: None,
-                            llm_port: None,
-                        };
-                        if let Err(e) = response.send(&mut stream).await {
-                            eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
-                        }
-                    }
-                }
-                Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
-                    if granted {
-                        let mut authorized = AUTHORIZED_PEERS.lock().await;
-                        authorized.insert(addr.ip().to_string());
-                        
-                        // Store LLM connection details if provided
-                        if let (Some(host), Some(port)) = (llm_host, llm_port) {
-                            let mut connections = LLM_CONNECTIONS.lock().await;
-                            connections.insert(addr.ip().to_string(), (host, port));
-                            println!("TCP: LLM access granted by {} - {} (LLM available at {}:{})", 
-                                   addr, message, host, port);
+                            
+                            // Store LLM connection details if provided
+                            if let (Some(host), Some(port)) = (llm_host.clone(), llm_port) {
+                                let mut connections = LLM_CONNECTIONS.lock().await;
+                                connections.insert(addr.ip().to_string(), (host.clone(), port));
+                                println!("TCP: LLM access granted by {} - {} (LLM available at {}:{})", 
+                                       addr, message, host, port);
+                            } else {
+                                println!("TCP: LLM access granted by {} - {}", addr, message);
+                            }
                         } else {
-                            println!("TCP: LLM access granted by {} - {}", addr, message);
+                            println!("TCP: LLM access denied by {} - {}", addr, message);
                         }
-                    } else {
-                        println!("TCP: LLM access denied by {} - {}", addr, message);
                     }
+                    // Handle other message types...
+                    _ => {}
                 }
+            }
+            Ok(None) => {
+                println!("TCP: Connection closed by {}", addr);
+                break;
+            }
+            Err(e) => {
+                eprintln!("TCP: Error reading from {}: {}", addr, e);
+                return Err(e);
             }
         }
     }
+    Ok(())
 }
 
 pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
@@ -332,33 +369,42 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                         println!("TCP: Announced no LLM capability to {} (Ollama not available)", addr);
                     }
 
-                    // If peer has LLM and we're not authorized, request access
-                    let llm_peers = LLM_PEERS.lock().await;
-                    let authorized = AUTHORIZED_PEERS.lock().await;
-                    if llm_peers.contains(&ip) && !authorized.contains(&ip) {
-                        drop(llm_peers);
-                        drop(authorized);
-                        if let Err(e) = request_llm_access(&mut stream, &addr).await {
-                            eprintln!("TCP: Failed to request LLM access from {}: {}", addr, e);
-                        }
-                    }
-
-                    // Send local conversations
-                    if let Ok(entries) = fs::read_dir(CONVERSATIONS_DIR).await {
-                        let mut entries = entries;
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            if let Ok(content) = fs::read_to_string(entry.path()).await {
-                                if let Some(file_name) = entry.file_name().to_str() {
-                                    let message = Message::ConversationFile {
-                                        name: file_name.to_string(),
-                                        content,
-                                    };
-                                    if let Err(e) = message.send(&mut stream).await {
-                                        eprintln!("TCP: Failed to send file to {}: {}", addr, e);
-                                    } else {
-                                        println!("TCP: Successfully sent {} to {}", file_name, addr);
+                    // Keep connection alive and handle messages
+                    loop {
+                        match Message::receive(&mut stream).await {
+                            Ok(Some(message)) => {
+                                match message {
+                                    Message::LLMCapability { has_llm } => {
+                                        let mut llm_peers = LLM_PEERS.lock().await;
+                                        if has_llm {
+                                            llm_peers.insert(ip.clone());
+                                            println!("TCP: Peer {} has LLM capability", addr);
+                                            
+                                            // Check if we need to request access
+                                            let authorized = AUTHORIZED_PEERS.lock().await;
+                                            if !authorized.contains(&ip) {
+                                                drop(authorized);
+                                                drop(llm_peers);
+                                                if let Err(e) = request_llm_access(&mut stream, &addr).await {
+                                                    eprintln!("TCP: Failed to request LLM access: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            llm_peers.remove(&ip);
+                                            println!("TCP: Peer {} does not have LLM capability", addr);
+                                        }
                                     }
+                                    _ => continue,
                                 }
+                            }
+                            Ok(None) => {
+                                println!("TCP: Connection closed by {}", addr);
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("TCP: Error reading from {}: {}", addr, e);
+                                break;
                             }
                         }
                     }
@@ -384,18 +430,43 @@ async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Resu
     request.send(stream).await?;
     println!("TCP: Sent LLM access request to {}", addr);
 
-    // Wait for response
-    if let Some(Message::LLMAccessResponse { granted, message }) = Message::receive(stream).await? {
-        if granted {
-            println!("TCP: LLM access granted by {} - {}", addr, message);
-            let mut authorized = AUTHORIZED_PEERS.lock().await;
-            authorized.insert(addr.to_string());
-        } else {
-            println!("TCP: LLM access denied by {} - {}", addr, message);
+    // Wait for response with timeout
+    let timeout = Duration::from_secs(5);
+    let response = tokio::time::timeout(timeout, Message::receive(stream)).await;
+
+    match response {
+        Ok(Ok(Some(Message::LLMAccessResponse { granted, message, llm_host, llm_port }))) => {
+            if granted {
+                println!("TCP: LLM access granted by {} - {}", addr, message);
+                let mut authorized = AUTHORIZED_PEERS.lock().await;
+                authorized.insert(addr.to_string());
+                
+                // Store LLM connection details if provided
+                if let (Some(host), Some(port)) = (llm_host, llm_port) {
+                    let mut connections = LLM_CONNECTIONS.lock().await;
+                    connections.insert(addr.to_string(), (host, port));
+                }
+                Ok(true)
+            } else {
+                println!("TCP: LLM access denied by {} - {}", addr, message);
+                Ok(false)
+            }
         }
-        Ok(granted)
-    } else {
-        println!("TCP: No response received for LLM access request from {}", addr);
-        Ok(false)
+        Ok(Ok(None)) => {
+            println!("TCP: Connection closed while waiting for LLM access response from {}", addr);
+            Ok(false)
+        }
+        Ok(Ok(Some(_))) => {
+            println!("TCP: Unexpected message type received from {} while waiting for LLM access response", addr);
+            Ok(false)
+        }
+        Ok(Err(e)) => {
+            eprintln!("TCP: Error reading LLM access response from {}: {}", addr, e);
+            Err(e)
+        }
+        Err(_) => {
+            println!("TCP: Timeout waiting for LLM access response from {}", addr);
+            Ok(false)
+        }
     }
 } 

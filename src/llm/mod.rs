@@ -7,7 +7,16 @@ use crate::conversation::{ChatMessage, CONVERSATION_STORE};
 use crate::tcp::LLM_CONNECTIONS;
 use std::time::Duration;
 
-const LOCAL_OLLAMA_HOST: &str = "http://127.0.0.1:11434";
+// Remove the constant and make it a function that returns the correct URL
+async fn get_ollama_url() -> String {
+    let connections = LLM_CONNECTIONS.lock().await;
+    if let Some((host, port)) = connections.values().next() {
+        format!("http://{}:{}", host, port)
+    } else {
+        "http://127.0.0.1:11434".to_string()
+    }
+}
+
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -50,10 +59,27 @@ struct OllamaResponse {
     eval_duration: Option<i64>,
 }
 
+// Update the is_local_ollama_available function
+async fn is_local_ollama_available() -> bool {
+    if let Ok(client) = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build() 
+    {
+        let url = get_ollama_url().await;
+        match client.get(&url).send().await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    }
+}
+
 async fn try_local_llm(req: &OllamaRequest) -> Result<String, String> {
     let client = Client::new();
+    let url = get_ollama_url().await;
     let response = client
-        .post(format!("{}/api/chat", LOCAL_OLLAMA_HOST))
+        .post(format!("{}/api/chat", url))
         .json(&req)
         .send()
         .await
@@ -72,6 +98,10 @@ async fn try_local_llm(req: &OllamaRequest) -> Result<String, String> {
 async fn try_remote_llm(req: &OllamaRequest) -> Result<String, String> {
     let connections = LLM_CONNECTIONS.lock().await;
     
+    if connections.is_empty() {
+        return Err("No remote LLM connections available".to_string());
+    }
+
     // Try each known LLM connection
     for (peer, (host, port)) in connections.iter() {
         let client = Client::builder()
@@ -146,20 +176,37 @@ pub async fn chat(req: web::Json<ChatRequest>) -> Result<HttpResponse, Error> {
         ],
     };
 
-    // Try local LLM first
-    let response = match try_local_llm(&ollama_req).await {
-        Ok(response) => response,
-        Err(local_error) => {
-            // If local fails, try remote LLMs
-            match try_remote_llm(&ollama_req).await {
-                Ok(response) => response,
-                Err(remote_error) => {
-                    return Ok(HttpResponse::ServiceUnavailable()
-                        .json(serde_json::json!({
-                            "error": "No available LLM service",
-                            "details": format!("Local error: {}. Remote error: {}", local_error, remote_error)
-                        })));
+    // Check if we have local Ollama first
+    let has_local_llm = is_local_ollama_available().await;
+    
+    let response = if has_local_llm {
+        // Try local first if available
+        match try_local_llm(&ollama_req).await {
+            Ok(response) => response,
+            Err(local_error) => {
+                // If local fails, try remote
+                match try_remote_llm(&ollama_req).await {
+                    Ok(response) => response,
+                    Err(remote_error) => {
+                        return Ok(HttpResponse::ServiceUnavailable()
+                            .json(serde_json::json!({
+                                "error": "No available LLM service",
+                                "details": format!("Local error: {}. Remote error: {}", local_error, remote_error)
+                            })));
+                    }
                 }
+            }
+        }
+    } else {
+        // No local LLM, try remote directly
+        match try_remote_llm(&ollama_req).await {
+            Ok(response) => response,
+            Err(remote_error) => {
+                return Ok(HttpResponse::ServiceUnavailable()
+                    .json(serde_json::json!({
+                        "error": "No available LLM service",
+                        "details": format!("No local LLM available. Remote error: {}", remote_error)
+                    })));
             }
         }
     };
