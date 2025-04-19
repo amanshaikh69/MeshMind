@@ -1,9 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-type Message = { role: 'user' | 'assistant'; content: string };
-import { Brain, Send, Bot, Loader2 } from 'lucide-react';
+import { Brain, Send, Bot, Loader2, Users } from 'lucide-react';
 import { sendMessageToLLM } from './api/llm';
+import { PeersConversation } from './PeersConversation';
 
-function App() {
+type Message = { role: 'user' | 'assistant'; content: string };
+
+function ChatPage({ onNavigate }: { onNavigate: (page: string) => void }) {
   const [inputValue, setInputValue] = useState('');
   const [conversation, setConversation] = useState<Message[]>([]);
   const [isTyping, setIsTyping] = useState(false);
@@ -28,7 +30,7 @@ function App() {
     setIsTyping(true);
     
     try {
-      const response = await sendMessageToLLM(inputValue, conversation);
+      const response = await sendMessageToLLM(inputValue);
       setIsTyping(false);
       setConversation([
         ...newConversation,
@@ -55,9 +57,18 @@ function App() {
     <div className="min-h-screen bg-[#111111] text-white flex flex-col">
       {/* Header */}
       <div className="border-b border-gray-800 p-4">
-        <div className="flex items-center justify-center gap-2">
-          <Brain className="h-7 w-7 text-blue-400" />
-          <h1 className="text-4xl font-bold text-white">AI NETWORK</h1>
+        <div className="flex items-center justify-between max-w-6xl mx-auto">
+          <div className="flex items-center gap-2">
+            <Brain className="h-7 w-7 text-blue-400" />
+            <h1 className="text-4xl font-bold text-white">AI NETWORK</h1>
+          </div>
+          <button
+            onClick={() => onNavigate('peers')}
+            className="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#222222] rounded-lg"
+          >
+            <Users className="h-5 w-5" />
+            <span>Peer Conversations</span>
+          </button>
         </div>
       </div>
 
@@ -122,6 +133,31 @@ function App() {
           </button>
         </form>
       </div>
+    </div>
+  );
+}
+
+function App() {
+  const [currentPage, setCurrentPage] = useState('chat');
+
+  return (
+    <div>
+      {currentPage === 'chat' ? (
+        <ChatPage onNavigate={setCurrentPage} />
+      ) : (
+        <div>
+          <div className="fixed top-4 left-4 z-10">
+            <button
+              onClick={() => setCurrentPage('chat')}
+              className="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#222222] rounded-lg"
+            >
+              <Brain className="h-5 w-5" />
+              <span>Back to Chat</span>
+            </button>
+          </div>
+          <PeersConversation />
+        </div>
+      )}
     </div>
   );
 }

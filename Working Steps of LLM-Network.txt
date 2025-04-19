@@ -1,0 +1,82 @@
+Working Steps of LLM-Network: Peer-to-Peer Language Model Sharing System
+
+1. Network Initialization and Peer Discovery
+   a. System startup:
+      - Node initializes UDP module on port 5000
+      - Automatic detection of network interfaces
+      - Preparation of TCP listeners for peer connections
+   
+   b. Peer Discovery Process:
+      - Broadcast UDP discovery messages across the network
+      - Listen for responses from other peers
+      - Maintain active peer list with 60-second timeout mechanism
+      - Exchange LLM capability information
+
+2. Resource Management and LLM Integration
+   a. Local Resource Setup:
+      - Initialize connection with local Ollama instance
+      - Register available language models
+      - Configure resource allocation limits
+   
+   b. Capability Broadcasting:
+      - Announce available LLM models to network
+      - Share resource capacity information
+      - Update peer capability registry
+      - Monitor resource availability
+
+3. Communication and Data Flow
+   a. Establishing Connections:
+      - TCP connection initialization between peers
+      - Handshake protocol execution
+      - Session establishment
+   
+   b. Message Handling:
+      - Process incoming requests
+      - Queue management for LLM tasks
+      - Load distribution across available peers
+      - Response routing and delivery
+
+4. Conversation Management
+   a. Local Processing:
+      - Create and manage conversation sessions
+      - Store chat history locally
+      - Handle user input/output
+   
+   b. Synchronization:
+      - Real-time conversation updates across peers
+      - State synchronization between nodes
+      - Conflict resolution mechanisms
+
+5. User Interface Interaction
+   a. Web Interface Operations:
+      - Display real-time chat interface
+      - Show peer status and availability
+      - Present LLM model options
+      - Handle user inputs and commands
+
+6. Data Persistence and Recovery
+   a. Storage Management:
+      - Save conversation history
+      - Cache peer information
+      - Store system configurations
+   
+   b. Recovery Procedures:
+      - Handle peer disconnections
+      - Implement fallback mechanisms
+      - Restore conversation states
+      - Reconnect to network
+
+7. System Monitoring and Maintenance
+   a. Health Checks:
+      - Monitor peer connectivity
+      - Track resource usage
+      - Verify LLM availability
+      - Check system performance
+
+   b. Maintenance Tasks:
+      - Clean up expired sessions
+      - Update peer registry
+      - Optimize resource allocation
+      - Manage system logs
+
+This peer-to-peer system creates a robust, decentralized network for sharing LLM capabilities across multiple nodes, enabling efficient resource utilization and real-time collaboration while maintaining system reliability and data persistence. 

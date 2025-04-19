@@ -60,6 +60,12 @@ async fn get_root_files(path: actix_web::web::Path<String>) -> impl Responder {
     send_file_or_default(path)
 }
 
+#[get("/api/peers")]
+async fn get_peers() -> Result<HttpResponse, actix_web::Error> {
+    let peer_conversations = CONVERSATION_STORE.get_peer_conversations().await;
+    Ok(HttpResponse::Ok().json(peer_conversations))
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Initialize conversations directory silently
@@ -106,11 +112,12 @@ async fn main() -> std::io::Result<()> {
                 .allow_any_header()
         )
             .service(web::scope("/api")
-                .service(llm::chat))
+                .service(llm::chat)
+                .service(get_peers))
             .service(get_index)
             .service(get_root_files)
     })
-    .bind(("0.0.0.0", 8080))?
+    .bind(("0.0.0.0", 8081))?
     .run()
     .await
 }

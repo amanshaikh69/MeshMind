@@ -87,10 +87,10 @@ impl ConversationStore {
     }
 
     pub async fn add_peer_conversation(&self, peer_ip: String, conversation: Conversation) {
-        let mut peers = self.peer_conversations.lock().await;
-        peers.insert(peer_ip.clone(), conversation.clone());
+        let mut peer_conversations = self.peer_conversations.lock().await;
+        peer_conversations.insert(peer_ip.clone(), conversation.clone());
         
-        // Save peer conversation
+        // Save to disk
         if let Err(e) = persistence::save_peer_conversation(&peer_ip, &conversation).await {
             eprintln!("Error saving peer conversation: {}", e);
         }
@@ -114,6 +114,11 @@ impl ConversationStore {
         *peers_lock = peers;
 
         Ok(())
+    }
+
+    pub async fn get_peer_conversations(&self) -> HashMap<String, Conversation> {
+        let peers = self.peer_conversations.lock().await;
+        peers.clone()
     }
 }
 

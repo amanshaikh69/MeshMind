@@ -2,14 +2,31 @@
   "id": "local",
   "messages": [
     {
-      "content": "Hello! How can I assist you today?",
-      "timestamp": "2025-03-17T08:03:14.810705400Z",
-      "sender": "user"
+      "content": "helllo",
+      "timestamp": "2025-03-25T13:56:00.304707400Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.1.8",
+        "is_llm_host": false
+      }
     },
     {
-      "content": "Certainly! Below is a simple C program that prints \"Hello, World!\" to the console:\n\n```c\n#include <stdio.h>\n\nint main() {\n    printf(\"Hello, World!\\n\");\n    return 0;\n}\n```\n\n### Explanation:\n- `#include <stdio.h>`: This line includes the standard input-output library which is necessary for using the `printf` function.\n- `int main()`: This is the entry point of the program. Every C program must have a `main` function.\n- `printf(\"Hello, World!\\n\");`: This line prints the string \"Hello, World!\" to the console. The `\\n` at the end of the string is a newline character that moves the cursor to the next line after printing.\n- `return 0;`: This statement indicates that the program ended successfully.\n\nTo compile and run this program, you can use a C compiler like `gcc`. Here are the steps:\n\n1. Save the code in a file named `hello.c`.\n2. Open your terminal or command prompt.\n3. Navigate to the directory where you saved `hello.c`.\n4. Compile the program using the following command:\n   ```sh\n   gcc hello.c -o hello\n   ```\n5. Run the compiled program using:\n   ```sh\n   ./hello\n   ```\n\nYou should see \"Hello, World!\" printed in your console.",
-      "timestamp": "2025-03-17T08:03:33.130413100Z",
-      "sender": "user"
+      "content": "hi",
+      "timestamp": "2025-03-28T13:08:30.374772900Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.210.8",
+        "is_llm_host": false
+      }
     }
-  ]
+  ],
+  "host_info": {
+    "hostname": "Omkar",
+    "ip_address": "192.168.1.8",
+    "is_llm_host": false
+  }
 }

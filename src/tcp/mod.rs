@@ -52,36 +52,45 @@ impl Message {
     async fn send(&self, stream: &mut TcpStream) -> std::io::Result<()> {
         match self {
             Message::ConversationFile { name, content } => {
+                println!("TCP: Sending file {} with size {} bytes", name, content.len());
+                
                 // Send marker
                 stream.write_all(b"FILE:").await?;
                 
-                // Prepare the data with a clear separator
-                let data = format!("{}|{}", name, content);
-                let len = data.len() as u64;
+                // Calculate and send total length
+                let full_content = format!("{}|{}", name, content);
+                let len = full_content.len() as u64;
+                stream.write_all(&len.to_le_bytes()).await?;
                 
-                // Send length and verify it was written
-                let len_bytes = len.to_le_bytes();
-                let bytes_written = stream.write(&len_bytes).await?;
-                if bytes_written != 8 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        format!("Failed to write complete length (wrote {} of 8 bytes)", bytes_written)
-                    ));
+                // Send data in chunks
+                let data = full_content.as_bytes();
+                const CHUNK_SIZE: usize = 8192;
+                
+                for chunk in data.chunks(CHUNK_SIZE) {
+                    match tokio::time::timeout(Duration::from_secs(30), stream.write_all(chunk)).await {
+                        Ok(Ok(_)) => {
+                            stream.flush().await?;
+                        },
+                        Ok(Err(e)) => {
+                            eprintln!("TCP: Error sending chunk: {}", e);
+                            return Err(e);
+                        },
+                        Err(_) => {
+                            let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout sending chunk");
+                            eprintln!("TCP: {}", err);
+                            return Err(err);
+                        }
+                    }
                 }
                 
-                // Send data and verify it was written
-                let bytes_written = stream.write(data.as_bytes()).await?;
-                if bytes_written != data.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        format!("Failed to write complete data (wrote {} of {} bytes)", bytes_written, data.len())
-                    ));
-                }
-            }
+                println!("TCP: Successfully sent file {}", name);
+                return Ok(());
+            },
             Message::SyncRequest => {
                 stream.write_all(b"SYNC:").await?;
                 let len = 0u64;
                 stream.write_all(&len.to_le_bytes()).await?;
+                return Ok(());
             }
             Message::SyncResponse(conversations) => {
                 stream.write_all(b"RESP:").await?;
@@ -89,6 +98,7 @@ impl Message {
                 let len = data.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
+                return Ok(());
             }
             Message::LLMCapability { has_llm } => {
                 stream.write_all(b"LLMC:").await?;
@@ -96,6 +106,7 @@ impl Message {
                 let len = data.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
+                return Ok(());
             }
             Message::LLMAccessRequest { peer_name, reason } => {
                 stream.write_all(b"LREQ:").await?;
@@ -103,6 +114,7 @@ impl Message {
                 let len = data.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
+                return Ok(());
             }
             Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
                 stream.write_all(b"LRES:").await?;
@@ -112,6 +124,7 @@ impl Message {
                 let len = data.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
+                return Ok(());
             }
         }
         stream.flush().await?;
@@ -121,38 +134,52 @@ impl Message {
     async fn receive(stream: &mut TcpStream) -> std::io::Result<Option<Message>> {
         let mut marker = [0u8; 5];
         
-        // Read marker with proper error handling
-        match stream.read_exact(&mut marker).await {
-            Ok(_) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        // Read marker with timeout
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut marker)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout reading marker")),
         }
 
-        // Read length with verification
+        // Read length with timeout
         let mut len_bytes = [0u8; 8];
-        match stream.read_exact(&mut len_bytes).await {
-            Ok(_) => (),
-            Err(e) => {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len_bytes)).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) => {
                 eprintln!("TCP: Failed to read message length: {}", e);
                 return Err(e);
             }
+            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout reading length")),
         }
         
         let len = u64::from_le_bytes(len_bytes) as usize;
-        if len > 1024 * 1024 * 10 { // 10MB limit
+        if len > 1024 * 1024 * 50 { // 50MB limit
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Message too large: {} bytes", len)
             ));
         }
 
-        // Read data with verification
-        let mut data = vec![0u8; len];
-        match stream.read_exact(&mut data).await {
-            Ok(_) => (),
-            Err(e) => {
-                eprintln!("TCP: Failed to read message data: {}", e);
-                return Err(e);
+        // Read data in chunks with timeout
+        let mut data = Vec::with_capacity(len);
+        let mut remaining = len;
+        const CHUNK_SIZE: usize = 8192;
+
+        while remaining > 0 {
+            let chunk_size = remaining.min(CHUNK_SIZE);
+            let mut chunk = vec![0u8; chunk_size];
+            
+            match tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut chunk)).await {
+                Ok(Ok(_)) => {
+                    data.extend_from_slice(&chunk);
+                    remaining -= chunk_size;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("TCP: Failed to read chunk: {}", e);
+                    return Err(e);
+                }
+                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout reading chunk")),
             }
         }
 
@@ -160,6 +187,7 @@ impl Message {
             b"FILE:" => {
                 let content = String::from_utf8_lossy(&data);
                 if let Some((name, content)) = content.split_once('|') {
+                    println!("TCP: Received file {} with size {} bytes", name, content.len());
                     Ok(Some(Message::ConversationFile {
                         name: name.to_string(),
                         content: content.to_string(),
@@ -311,6 +339,13 @@ async fn periodic_conversation_share(mut stream: TcpStream, addr: std::net::Sock
                 }
             }
         }
+
+        // Request sync from peer to ensure we have their latest conversation
+        let sync_request = Message::SyncRequest;
+        if let Err(e) = sync_request.send(&mut stream).await {
+            eprintln!("TCP: Periodic share - Failed to send sync request to {}: {}", addr, e);
+            break;
+        }
     }
 }
 
@@ -355,13 +390,18 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         
         let message = Message::ConversationFile {
             name: "local.json".to_string(),
-            content,
+            content: content.clone(),
         };
         
         if let Err(e) = message.send(&mut stream).await {
             eprintln!("TCP: Failed to send local conversation to {}: {}", addr, e);
         } else {
             println!("TCP: Sent local conversation to {}", addr);
+            
+            // Also save the conversation to the peer's directory
+            if let Err(e) = fs::write(peer_dir.join("local.json"), content).await {
+                eprintln!("TCP: Failed to save conversation for {}: {}", addr, e);
+            }
         }
     }
 
@@ -371,16 +411,52 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
             Ok(Some(message)) => {
                 match message {
                     Message::ConversationFile { name, content } => {
-                        // Save the conversation in the peer's directory
-                        let file_path = peer_dir.join(&name);
-                        if let Err(e) = fs::write(&file_path, content.as_bytes()).await {
-                            eprintln!("TCP: Failed to save received file {}: {}", name, e);
-                        } else {
-                            println!("TCP: Received and saved conversation file {} from {}", name, addr);
-                            
-                            // Try to load the received conversation
-                            if let Ok(conversation) = serde_json::from_str::<Conversation>(&content) {
-                                CONVERSATION_STORE.add_peer_conversation(addr.ip().to_string(), conversation).await;
+                        if name == "local.json" {
+                            // Parse the conversation
+                            match serde_json::from_str::<Conversation>(&content) {
+                                Ok(conversation) => {
+                                    // Save to peer's directory
+                                    if let Err(e) = fs::write(peer_dir.join(&name), &content).await {
+                                        eprintln!("TCP: Failed to save conversation from {}: {}", addr, e);
+                                    } else {
+                                        println!("TCP: Saved conversation from {} to {}", addr, name);
+                                        
+                                        // Update peer conversations in store
+                                        CONVERSATION_STORE.add_peer_conversation(addr.ip().to_string(), conversation).await;
+
+                                        // Send our local conversation in response to ensure both sides are synced
+                                        if let Some(local_conv) = CONVERSATION_STORE.get_local_conversation().await {
+                                            if let Ok(local_content) = serde_json::to_string(&local_conv) {
+                                                let response = Message::ConversationFile {
+                                                    name: "local.json".to_string(),
+                                                    content: local_content,
+                                                };
+                                                if let Err(e) = response.send(&mut stream).await {
+                                                    eprintln!("TCP: Failed to send local conversation in response: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("TCP: Failed to parse conversation from {}: {}", addr, e);
+                                }
+                            }
+                        }
+                    }
+                    Message::SyncRequest => {
+                        // Respond with our local conversation
+                        if let Some(conversation) = CONVERSATION_STORE.get_local_conversation().await {
+                            if let Ok(content) = serde_json::to_string(&conversation) {
+                                let response = Message::ConversationFile {
+                                    name: "local.json".to_string(),
+                                    content,
+                                };
+                                if let Err(e) = response.send(&mut stream).await {
+                                    eprintln!("TCP: Failed to send local conversation for sync: {}", e);
+                                } else {
+                                    println!("TCP: Sent local conversation in response to sync request from {}", addr);
+                                }
                             }
                         }
                     }
