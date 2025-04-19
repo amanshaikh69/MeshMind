@@ -102,16 +102,30 @@ impl ConversationStore {
     }
 
     pub async fn load_saved_conversations(&self) -> std::io::Result<()> {
+        println!("Loading saved conversations...");
+        
         // Load local conversation
         if let Ok(Some(local)) = persistence::load_local_conversation().await {
+            println!("Loaded local conversation");
             let mut local_lock = self.local_conversation.lock().await;
             *local_lock = Some(local);
         }
 
         // Load peer conversations
-        let peers = persistence::load_all_peer_conversations().await?;
-        let mut peers_lock = self.peer_conversations.lock().await;
-        *peers_lock = peers;
+        match persistence::load_all_peer_conversations().await {
+            Ok(peers) => {
+                println!("Successfully loaded {} peer conversations", peers.len());
+                let mut peers_lock = self.peer_conversations.lock().await;
+                *peers_lock = peers;
+                for (peer, conv) in &*peers_lock {
+                    println!("Loaded conversation for peer {} with {} messages", peer, conv.messages.len());
+                }
+            }
+            Err(e) => {
+                eprintln!("Error loading peer conversations: {}", e);
+                return Err(e);
+            }
+        }
 
         Ok(())
     }

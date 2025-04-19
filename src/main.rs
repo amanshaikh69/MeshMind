@@ -60,9 +60,14 @@ async fn get_root_files(path: actix_web::web::Path<String>) -> impl Responder {
     send_file_or_default(path)
 }
 
-#[get("/api/peers")]
+#[get("/peers")]
 async fn get_peers() -> Result<HttpResponse, actix_web::Error> {
+    println!("API: Received request for peer conversations");
     let peer_conversations = CONVERSATION_STORE.get_peer_conversations().await;
+    println!("API: Found {} peer conversations", peer_conversations.len());
+    for (peer, conv) in &peer_conversations {
+        println!("API: Peer {} has {} messages", peer, conv.messages.len());
+    }
     Ok(HttpResponse::Ok().json(peer_conversations))
 }
 
@@ -110,10 +115,12 @@ async fn main() -> std::io::Result<()> {
                 .allow_any_origin()
                 .allow_any_method()
                 .allow_any_header()
+                .expose_headers(["content-type", "content-length"])
+                .max_age(3600)
         )
             .service(web::scope("/api")
-                .service(llm::chat)
-                .service(get_peers))
+                .service(llm::chat))
+            .service(get_peers)
             .service(get_index)
             .service(get_root_files)
     })

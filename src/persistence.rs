@@ -54,23 +54,55 @@ pub async fn load_all_peer_conversations() -> std::io::Result<HashMap<String, Co
     let mut peer_conversations = HashMap::new();
     let received_path = Path::new(RECEIVED_DIR);
     
+    println!("Loading peer conversations from: {}", received_path.display());
+    
     if !received_path.exists() {
+        println!("Creating received directory as it does not exist");
+        fs::create_dir_all(received_path).await?;
         return Ok(peer_conversations);
     }
     
+    // Read all directories in the received folder
     let mut entries = fs::read_dir(received_path).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            let peer_ip = entry.file_name().to_string_lossy().to_string();
-            let conversation_path = entry.path().join("local.json");
+        let file_type = entry.file_type().await?;
+        let peer_ip = entry.file_name().to_string_lossy().to_string();
+        
+        println!("Found entry: {} (is_dir: {})", peer_ip, file_type.is_dir());
+        
+        if file_type.is_dir() {
+            let local_json_path = entry.path().join("local.json");
+            println!("Checking for local.json at: {}", local_json_path.display());
             
-            if conversation_path.exists() {
-                let content = fs::read_to_string(conversation_path).await?;
-                if let Ok(conversation) = serde_json::from_str(&content) {
-                    peer_conversations.insert(peer_ip, conversation);
+            if local_json_path.exists() {
+                println!("Found local.json for peer: {}", peer_ip);
+                match fs::read_to_string(&local_json_path).await {
+                    Ok(content) => {
+                        match serde_json::from_str::<Conversation>(&content) {
+                            Ok(conversation) => {
+                                println!("Successfully loaded conversation for peer: {}", peer_ip);
+                                println!("Conversation contains {} messages", conversation.messages.len());
+                                peer_conversations.insert(peer_ip, conversation);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to parse conversation for peer {}: {}", peer_ip, e);
+                                eprintln!("Content: {}", content);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read local.json for peer {}: {}", peer_ip, e);
+                    }
                 }
+            } else {
+                println!("No local.json found at: {}", local_json_path.display());
             }
         }
+    }
+    
+    println!("Loaded {} peer conversations", peer_conversations.len());
+    for (peer, conv) in &peer_conversations {
+        println!("Peer {} has {} messages", peer, conv.messages.len());
     }
     
     Ok(peer_conversations)
