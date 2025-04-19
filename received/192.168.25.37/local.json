@@ -1,0 +1,54 @@
+{
+  "id": "local",
+  "messages": [
+    {
+      "content": "helllo",
+      "timestamp": "2025-03-25T13:56:00.304707400Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.1.8",
+        "is_llm_host": false
+      }
+    },
+    {
+      "content": "hi",
+      "timestamp": "2025-03-28T13:08:30.374772900Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.210.8",
+        "is_llm_host": false
+      }
+    },
+    {
+      "content": "hi",
+      "timestamp": "2025-04-19T10:12:04.929122Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.31.75",
+        "is_llm_host": true
+      }
+    },
+    {
+      "content": "Hello! How can I assist you today?",
+      "timestamp": "2025-04-19T10:12:13.506656Z",
+      "sender": "LLM",
+      "message_type": "Response",
+      "host_info": {
+        "hostname": "Omkar",
+        "ip_address": "192.168.31.75",
+        "is_llm_host": true
+      }
+    }
+  ],
+  "host_info": {
+    "hostname": "Omkar",
+    "ip_address": "192.168.1.8",
+    "is_llm_host": false
+  }
+}

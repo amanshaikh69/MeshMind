@@ -5,10 +5,20 @@ import { PeersConversation } from './PeersConversation';
 
 type Message = { role: 'user' | 'assistant'; content: string };
 
-function ChatPage({ onNavigate }: { onNavigate: (page: string) => void }) {
+function ChatPage({ 
+  onNavigate, 
+  conversation, 
+  setConversation, 
+  isTyping, 
+  setIsTyping 
+}: { 
+  onNavigate: (page: string) => void;
+  conversation: Message[];
+  setConversation: (messages: Message[]) => void;
+  isTyping: boolean;
+  setIsTyping: (typing: boolean) => void;
+}) {
   const [inputValue, setInputValue] = useState('');
-  const [conversation, setConversation] = useState<Message[]>([]);
-  const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -139,17 +149,25 @@ function ChatPage({ onNavigate }: { onNavigate: (page: string) => void }) {
 
 function App() {
   const [currentPage, setCurrentPage] = useState('chat');
+  const [conversation, setConversation] = useState<Message[]>([]);
+  const [isTyping, setIsTyping] = useState(false);
 
   return (
     <div>
       {currentPage === 'chat' ? (
-        <ChatPage onNavigate={setCurrentPage} />
+        <ChatPage 
+          onNavigate={setCurrentPage} 
+          conversation={conversation}
+          setConversation={setConversation}
+          isTyping={isTyping}
+          setIsTyping={setIsTyping}
+        />
       ) : (
         <div>
           <div className="fixed top-4 left-4 z-10">
             <button
               onClick={() => setCurrentPage('chat')}
-              className="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#222222] rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-[#1a1a1a] hover:bg-[#222222] rounded-lg text-white"
             >
               <Brain className="h-5 w-5" />
               <span>Back to Chat</span>
