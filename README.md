@@ -372,14 +372,6 @@ cd C:\MeshMind
   - Output to file: `cargo run --release 2>&1 | Tee-Object -FilePath host.log`
   - Remote fetches are throttled internally (~15s TTL)
 
-## Research Notes (for paper writing)
-
-- Discovery: UDP broadcasts announce availability and collect peer IPs for subsequent HTTP/TCP use
-- Trust: symmetric HMAC authenticates announcements without PKI; secret distribution is out of band
-- Aggregation: a hybrid model that merges static received binaries with live peer lists to reduce inconsistency
-- UX: same‑origin proxy avoids cross‑origin cookie leakage while enabling direct peer downloads
-- Deployment: single Rust binary with embedded assets; peers can run from a copied exe with matching secret
-
 ## License
 
 MIT License
