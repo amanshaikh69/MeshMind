@@ -1,0 +1,43 @@
+{
+  "id": "local",
+  "messages": [
+    {
+      "content": "hi",
+      "timestamp": "2025-09-18T07:05:59.425559600Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "LAPTOP-1GI510ER",
+        "ip_address": "10.20.10.102",
+        "is_llm_host": false
+      }
+    },
+    {
+      "content": "hi",
+      "timestamp": "2025-09-18T07:33:18.340394100Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "LAPTOP-1GI510ER",
+        "ip_address": "192.168.28.98",
+        "is_llm_host": false
+      }
+    },
+    {
+      "content": "kill humans",
+      "timestamp": "2025-09-18T07:34:54.233727100Z",
+      "sender": "user",
+      "message_type": "Question",
+      "host_info": {
+        "hostname": "LAPTOP-1GI510ER",
+        "ip_address": "192.168.28.98",
+        "is_llm_host": false
+      }
+    }
+  ],
+  "host_info": {
+    "hostname": "LAPTOP-1GI510ER",
+    "ip_address": "10.20.10.102",
+    "is_llm_host": false
+  }
+}

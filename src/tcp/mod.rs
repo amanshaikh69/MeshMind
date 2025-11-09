@@ -1,3 +1,33 @@
+pub async fn set_p2p_secret(secret: String) {
+    let mut s = P2P_SECRET.lock().await;
+    *s = Some(secret);
+}
+
+pub async fn add_announced_file(info: FileInfo) {
+    let mut v = ANNOUNCED_FILES.lock().await;
+    // de-duplicate by filename + uploader_ip
+    if !v.iter().any(|f| f.filename == info.filename && f.uploader_ip == info.uploader_ip) {
+        v.push(info);
+    }
+}
+
+pub async fn get_announced_files() -> Vec<FileInfo> {
+    ANNOUNCED_FILES.lock().await.clone()
+}
+
+fn sign_file_meta(secret: &str, filename: &str, file_type: &str, file_size: u64, sha256_hex: &str, uploaded_at: &str) -> String {
+    let payload = format!("{}|{}|{}|{}|{}", filename, file_type, file_size, sha256_hex, uploaded_at);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(payload.as_bytes());
+    let res = mac.finalize().into_bytes();
+    hex::encode(res)
+}
+
+fn verify_file_meta(secret: &str, filename: &str, file_type: &str, file_size: u64, sha256_hex: &str, uploaded_at: &str, hmac_hex: &str) -> bool {
+    let expected = sign_file_meta(secret, filename, file_type, file_size, sha256_hex, uploaded_at);
+    expected.eq_ignore_ascii_case(hmac_hex)
+}
+
 use tokio::net::{TcpStream, TcpListener};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::sync::Mutex;
@@ -8,6 +38,11 @@ use std::path::Path;
 use std::collections::{HashSet, HashMap};
 use tokio::fs;
 use crate::conversation::{Conversation, CONVERSATION_STORE};
+use crate::persistence::FileInfo;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+type HmacSha256 = Hmac<Sha256>;
+
 use lazy_static::lazy_static;
 use reqwest::Client;
 
@@ -22,6 +57,26 @@ enum Message {
     ConversationFile {
         name: String,
         content: String,
+    },
+    FileTransfer {
+        filename: String,
+        file_type: String,
+        file_size: u64,
+        content: Vec<u8>,
+    },
+    FileChunk {
+        filename: String,
+        chunk_index: u32,
+        total_chunks: u32,
+        content: Vec<u8>,
+    },
+    FileMeta {
+        filename: String,
+        file_type: String,
+        file_size: u64,
+        sha256_hex: String,
+        uploaded_at: String,
+        hmac_hex: String,
     },
     SyncRequest,
     SyncResponse(Vec<Conversation>),
@@ -46,6 +101,56 @@ lazy_static! {
     static ref AUTHORIZED_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     pub static ref LLM_CONNECTIONS: Arc<Mutex<HashMap<String, (String, i32)>>> = Arc::new(Mutex::new(HashMap::new()));
     static ref CONNECTED_PEERS: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    static ref ACTIVE_STREAMS: Arc<Mutex<HashMap<String, TcpStream>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref P2P_SECRET: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    static ref ANNOUNCED_FILES: Arc<Mutex<Vec<FileInfo>>> = Arc::new(Mutex::new(Vec::new()));
+}
+
+pub async fn broadcast_file_to_peers(filename: String, file_type: String, content: Vec<u8>) {
+    // Send to all active streams regardless of who initiated the TCP connection
+    let mut streams = ACTIVE_STREAMS.lock().await;
+    let targets: Vec<String> = streams.keys().cloned().collect();
+    // Pre-compute meta
+    let file_size = content.len() as u64;
+    let sha = {
+        let mut hasher = Sha256::new();
+        use sha2::Digest;
+        hasher.update(&content);
+        hex::encode(hasher.finalize())
+    };
+    let uploaded_at = chrono::Utc::now().to_rfc3339();
+    let secret_opt = P2P_SECRET.lock().await.clone();
+    let hmac_hex = secret_opt
+        .as_ref()
+        .map(|s| sign_file_meta(s, &filename, &file_type, file_size, &sha, &uploaded_at))
+        .unwrap_or_else(|| "".to_string());
+
+    for peer_ip in targets.iter() {
+        if let Some(stream) = streams.get_mut(peer_ip) {
+            // Send FILE_META first (best-effort)
+            let meta = Message::FileMeta {
+                filename: filename.clone(),
+                file_type: file_type.clone(),
+                file_size,
+                sha256_hex: sha.clone(),
+                uploaded_at: uploaded_at.clone(),
+                hmac_hex: hmac_hex.clone(),
+            };
+            if let Err(e) = meta.send(stream).await {
+                eprintln!("TCP: Failed to send FILE_META to {}: {}", peer_ip, e);
+            }
+            let msg = Message::FileTransfer {
+                filename: filename.clone(),
+                file_type: file_type.clone(),
+                file_size,
+                content: content.clone(),
+            };
+            match msg.send(stream).await {
+                Ok(_) => println!("TCP: Broadcasted file {} to peer {}", filename, peer_ip),
+                Err(e) => eprintln!("TCP: Failed to broadcast file {} to peer {}: {}", filename, peer_ip, e),
+            }
+        }
+    }
 }
 
 impl Message {
@@ -53,19 +158,19 @@ impl Message {
         match self {
             Message::ConversationFile { name, content } => {
                 println!("TCP: Sending file {} with size {} bytes", name, content.len());
-                
+
                 // Send marker
                 stream.write_all(b"FILE:").await?;
-                
+
                 // Calculate and send total length
                 let full_content = format!("{}|{}", name, content);
                 let len = full_content.len() as u64;
                 stream.write_all(&len.to_le_bytes()).await?;
-                
+
                 // Send data in chunks
                 let data = full_content.as_bytes();
                 const CHUNK_SIZE: usize = 8192;
-                
+
                 for chunk in data.chunks(CHUNK_SIZE) {
                     match tokio::time::timeout(Duration::from_secs(30), stream.write_all(chunk)).await {
                         Ok(Ok(_)) => {
@@ -82,7 +187,7 @@ impl Message {
                         }
                     }
                 }
-                
+
                 println!("TCP: Successfully sent file {}", name);
                 return Ok(());
             },
@@ -91,7 +196,7 @@ impl Message {
                 let len = 0u64;
                 stream.write_all(&len.to_le_bytes()).await?;
                 return Ok(());
-            }
+            },
             Message::SyncResponse(conversations) => {
                 stream.write_all(b"RESP:").await?;
                 let data = serde_json::to_string(conversations)?;
@@ -99,7 +204,7 @@ impl Message {
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
                 return Ok(());
-            }
+            },
             Message::LLMCapability { has_llm } => {
                 stream.write_all(b"LLMC:").await?;
                 let data = has_llm.to_string();
@@ -107,7 +212,7 @@ impl Message {
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
                 return Ok(());
-            }
+            },
             Message::LLMAccessRequest { peer_name, reason } => {
                 stream.write_all(b"LREQ:").await?;
                 let data = format!("{}|{}", peer_name, reason);
@@ -115,7 +220,7 @@ impl Message {
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
                 return Ok(());
-            }
+            },
             Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
                 stream.write_all(b"LRES:").await?;
                 let host_str = llm_host.as_deref().unwrap_or("");
@@ -125,15 +230,47 @@ impl Message {
                 stream.write_all(&len.to_le_bytes()).await?;
                 stream.write_all(data.as_bytes()).await?;
                 return Ok(());
+            },
+            Message::FileTransfer { filename, file_type, file_size, content } => {
+                // Use a 5-byte marker to match other message markers (e.g. "FILE:")
+                stream.write_all(b"FTRS:").await?;
+
+                // Calculate and send total length
+                let header = format!("{}|{}|{}", filename, file_type, file_size);
+                let header_len = header.len() as u64;
+                let total_len = header_len + content.len() as u64;
+                stream.write_all(&total_len.to_le_bytes()).await?;
+
+                // Send header and data
+                stream.write_all(header.as_bytes()).await?;
+                stream.write_all(&content).await?;
+                return Ok(());
+            },
+            Message::FileChunk { filename, chunk_index, total_chunks, content } => {
+                stream.write_all(b"CHNK:").await?;
+                let header = format!("{}|{}|{}", filename, chunk_index, total_chunks);
+                let header_len = header.len() as u64;
+                let total_len = header_len + content.len() as u64;
+                stream.write_all(&total_len.to_le_bytes()).await?;
+                stream.write_all(header.as_bytes()).await?;
+                stream.write_all(&content).await?;
+                return Ok(());
+            },
+            Message::FileMeta { filename, file_type, file_size, sha256_hex, uploaded_at, hmac_hex } => {
+                stream.write_all(b"FMTA:").await?;
+                let data = format!("{}|{}|{}|{}|{}", filename, file_type, file_size, sha256_hex, uploaded_at);
+                let payload = format!("{}|{}", data, hmac_hex);
+                let len = payload.len() as u64;
+                stream.write_all(&len.to_le_bytes()).await?;
+                stream.write_all(payload.as_bytes()).await?;
+                return Ok(());
             }
         }
-        stream.flush().await?;
-        Ok(())
     }
 
     async fn receive(stream: &mut TcpStream) -> std::io::Result<Option<Message>> {
         let mut marker = [0u8; 5];
-        
+
         // Read marker with timeout
         match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut marker)).await {
             Ok(Ok(_)) => (),
@@ -152,7 +289,7 @@ impl Message {
             }
             Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout reading length")),
         }
-        
+
         let len = u64::from_le_bytes(len_bytes) as usize;
         if len > 1024 * 1024 * 50 { // 50MB limit
             return Err(std::io::Error::new(
@@ -169,7 +306,7 @@ impl Message {
         while remaining > 0 {
             let chunk_size = remaining.min(CHUNK_SIZE);
             let mut chunk = vec![0u8; chunk_size];
-            
+
             match tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut chunk)).await {
                 Ok(Ok(_)) => {
                     data.extend_from_slice(&chunk);
@@ -195,16 +332,16 @@ impl Message {
                 } else {
                     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid file format"))
                 }
-            }
+            },
             b"SYNC:" => Ok(Some(Message::SyncRequest)),
             b"RESP:" => {
                 let conversations = serde_json::from_slice(&data)?;
                 Ok(Some(Message::SyncResponse(conversations)))
-            }
+            },
             b"LLMC:" => {
                 let has_llm = String::from_utf8_lossy(&data).parse::<bool>().unwrap_or(false);
                 Ok(Some(Message::LLMCapability { has_llm }))
-            }
+            },
             b"LREQ:" => {
                 let content = String::from_utf8_lossy(&data);
                 if let Some((peer_name, reason)) = content.split_once('|') {
@@ -215,7 +352,7 @@ impl Message {
                 } else {
                     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid LLM request format"))
                 }
-            }
+            },
             b"LRES:" => {
                 let content = String::from_utf8_lossy(&data);
                 let parts: Vec<&str> = content.split('|').collect();
@@ -233,7 +370,85 @@ impl Message {
                 } else {
                     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid LLM response format"))
                 }
-            }
+            },
+            b"FTRS:" => {
+                // Parse header: filename|file_type|file_size followed by binary content
+                let content_str = String::from_utf8_lossy(&data);
+                let parts: Vec<&str> = content_str.split('|').collect();
+                if parts.len() >= 3 {
+                    let filename = parts[0].to_string();
+                    let file_type = parts[1].to_string();
+                    let file_size_str = parts[2];
+                    if let Ok(file_size) = file_size_str.parse::<u64>() {
+                        // Find the end of header: filename|file_type|file_size|
+                        let header_end = filename.len() + 1 + file_type.len() + 1 + file_size_str.len() + 1;
+                        if data.len() >= header_end {
+                            let content = data[header_end..].to_vec();
+                            println!("TCP: Received file transfer {} ({} bytes)", filename, content.len());
+                            Ok(Some(Message::FileTransfer {
+                                filename,
+                                file_type,
+                                file_size,
+                                content,
+                            }))
+                        } else {
+                            Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "File content too short"))
+                        }
+                    } else {
+                        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid file size"))
+                    }
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid file transfer format"))
+                }
+            },
+            b"CHNK:" => {
+                let content = String::from_utf8_lossy(&data);
+                if let Some(header_end) = content.find('\0') {
+                    let header = &content[..header_end];
+                    let file_data = &data[header_end + 1..];
+                    let parts: Vec<&str> = header.split('|').collect();
+                    if parts.len() == 3 {
+                        let filename = parts[0].to_string();
+                        let chunk_index = parts[1].parse().unwrap_or(0);
+                        let total_chunks = parts[2].parse().unwrap_or(1);
+                        Ok(Some(Message::FileChunk {
+                            filename,
+                            chunk_index,
+                            total_chunks,
+                            content: file_data.to_vec(),
+                        }))
+                    } else {
+                        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid file chunk format"))
+                    }
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid file chunk format"))
+                }
+            },
+            b"FMTA:" => {
+                let content = String::from_utf8_lossy(&data);
+                // format: filename|file_type|file_size|sha256|uploaded_at|hmac
+                let parts: Vec<&str> = content.split('|').collect();
+                if parts.len() >= 6 {
+                    let filename = parts[0].to_string();
+                    let file_type = parts[1].to_string();
+                    let file_size: u64 = parts[2].parse().unwrap_or(0);
+                    let sha256_hex = parts[3].to_string();
+                    let uploaded_at = parts[4].to_string();
+                    let hmac_hex = parts[5].to_string();
+                    let ok = if let Some(secret) = P2P_SECRET.blocking_lock().clone() { // blocking_lock ok in non-async context
+                        verify_file_meta(&secret, &filename, &file_type, file_size, &sha256_hex, &uploaded_at, &hmac_hex)
+                    } else { true };
+                    if !ok {
+                        eprintln!("TCP: Invalid HMAC for FILE_META {} — ignoring", filename);
+                        // Still return Some to consume the message but not act on metadata persistently
+                    } else {
+                        println!("TCP: Received FILE_META {} ({} bytes) sha={}", filename, file_size, sha256_hex);
+                    }
+                    Ok(Some(Message::FileMeta { filename, file_type, file_size, sha256_hex, uploaded_at, hmac_hex }))
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid FILE_META format"))
+                }
+            },
             _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown message type")),
         }
     }
@@ -405,148 +620,147 @@ async fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         }
     }
 
-    // Main message handling loop
+    // Before entering the main loop, clone the socket so we have a dedicated writable stream
+    // to use for broadcasts. Store it in ACTIVE_STREAMS keyed by peer IP.
+    let std_socket = match stream.into_std() {
+        Ok(socket) => socket,
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to extract std socket: {}", e)));
+        }
+    };
+
+    // Clone for handler and broadcaster
+    let std_socket_for_handler = match std_socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to clone std socket for handler: {}", e)));
+        }
+    };
+    let std_socket_for_broadcast = match std_socket.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to clone std socket for broadcast: {}", e)));
+        }
+    };
+
+    let mut stream = match TcpStream::from_std(std_socket_for_handler) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create tokio stream from handler socket: {}", e)));
+        }
+    };
+
+    let peer_ip_key = addr.ip().to_string();
+    match TcpStream::from_std(std_socket_for_broadcast) {
+        Ok(bstream) => {
+            let mut map = ACTIVE_STREAMS.lock().await;
+            map.insert(peer_ip_key.clone(), bstream);
+        }
+        Err(e) => {
+            eprintln!("TCP: Failed to create broadcast stream for {}: {}", addr, e);
+        }
+    }
+
+    // Main message handling loop for accepted connections
     loop {
         match Message::receive(&mut stream).await {
             Ok(Some(message)) => {
                 match message {
                     Message::ConversationFile { name, content } => {
-                        if name == "local.json" {
-                            // Parse the conversation
-                            match serde_json::from_str::<Conversation>(&content) {
-                                Ok(conversation) => {
-                                    // Save to peer's directory
-                                    if let Err(e) = fs::write(peer_dir.join(&name), &content).await {
-                                        eprintln!("TCP: Failed to save conversation from {}: {}", addr, e);
-                                    } else {
-                                        println!("TCP: Saved conversation from {} to {}", addr, name);
-                                        
-                                        // Update peer conversations in store
-                                        CONVERSATION_STORE.add_peer_conversation(addr.ip().to_string(), conversation).await;
-
-                                        // Send our local conversation in response to ensure both sides are synced
-                                        if let Some(local_conv) = CONVERSATION_STORE.get_local_conversation().await {
-                                            if let Ok(local_content) = serde_json::to_string(&local_conv) {
-                                                let response = Message::ConversationFile {
-                                                    name: "local.json".to_string(),
-                                                    content: local_content,
-                                                };
-                                                if let Err(e) = response.send(&mut stream).await {
-                                                    eprintln!("TCP: Failed to send local conversation in response: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("TCP: Failed to parse conversation from {}: {}", addr, e);
-                                }
-                            }
-                        }
-                    }
-                    Message::SyncRequest => {
-                        // Respond with our local conversation
-                        if let Some(conversation) = CONVERSATION_STORE.get_local_conversation().await {
-                            if let Ok(content) = serde_json::to_string(&conversation) {
-                                let response = Message::ConversationFile {
-                                    name: "local.json".to_string(),
-                                    content,
-                                };
-                                if let Err(e) = response.send(&mut stream).await {
-                                    eprintln!("TCP: Failed to send local conversation for sync: {}", e);
-                                } else {
-                                    println!("TCP: Sent local conversation in response to sync request from {}", addr);
-                                }
-                            }
-                        }
-                    }
-                    Message::LLMAccessRequest { peer_name, reason } => {
-                        if has_llm {
-                            println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
-                            
-                            // Include our IP and Ollama port in the response
-                            let response = Message::LLMAccessResponse {
-                                granted: true,
-                                message: "Access granted automatically".to_string(),
-                                llm_host: Some(local_ip.clone()),
-                                llm_port: Some(OLLAMA_PORT),
-                            };
-                            
-                            // Send response immediately and ensure it's sent
-                            if let Err(e) = response.send(&mut stream).await {
-                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
-                                return Err(e);
-                            }
-
-                            let mut authorized = AUTHORIZED_PEERS.lock().await;
-                            authorized.insert(addr.ip().to_string());
-                            println!("TCP: Granted LLM access to {} ({}) with port {}", addr, peer_name, OLLAMA_PORT);
+                        let file_path = peer_dir.join(&name);
+                        if let Err(e) = fs::write(&file_path, content.as_bytes()).await {
+                            eprintln!("TCP: Failed to save received file {}: {}", name, e);
                         } else {
-                            let response = Message::LLMAccessResponse {
-                                granted: false,
-                                message: "This peer does not have LLM capability".to_string(),
-                                llm_host: None,
-                                llm_port: None,
-                            };
-                            if let Err(e) = response.send(&mut stream).await {
-                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
-                                return Err(e);
+                            println!("TCP: Received and saved conversation file {} from {}", name, addr);
+                            if let Ok(conversation) = serde_json::from_str::<Conversation>(&content) {
+                                CONVERSATION_STORE.add_peer_conversation(addr.ip().to_string(), conversation).await;
                             }
                         }
                     }
                     Message::LLMCapability { has_llm } => {
-                        let ip = addr.ip().to_string();
                         let mut llm_peers = LLM_PEERS.lock().await;
                         if has_llm {
-                            llm_peers.insert(ip.clone());
+                            llm_peers.insert(addr.ip().to_string());
                             println!("TCP: Peer {} has LLM capability", addr);
-                            
-                            // Check if we need to request access
-                            let authorized = AUTHORIZED_PEERS.lock().await;
-                            if !authorized.contains(&ip) {
-                                drop(authorized);
-                                drop(llm_peers);
-                                // Send request on a delay to avoid race conditions
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                if let Err(e) = request_llm_access(&mut stream, &addr.to_string()).await {
-                                    eprintln!("TCP: Failed to request LLM access: {}", e);
-                                }
-                            }
                         } else {
-                            llm_peers.remove(&ip);
+                            llm_peers.remove(&addr.ip().to_string());
                             println!("TCP: Peer {} does not have LLM capability", addr);
                         }
                     }
-                    Message::LLMAccessResponse { granted, message, llm_host, llm_port } => {
-                        if granted {
-                            let mut authorized = AUTHORIZED_PEERS.lock().await;
-                            authorized.insert(addr.ip().to_string());
-                            
-                            // Store LLM connection details if provided
-                            if let (Some(host), Some(port)) = (llm_host.clone(), llm_port) {
-                                let mut connections = LLM_CONNECTIONS.lock().await;
-                                connections.insert(addr.ip().to_string(), (host.clone(), port));
-                                println!("TCP: LLM access granted by {} - {} (LLM available at {}:{})", 
-                                       addr, message, host, port);
-                            } else {
-                                println!("TCP: LLM access granted by {} - {}", addr, message);
+                    Message::LLMAccessRequest { peer_name, reason } => {
+                        println!("TCP: Received LLM access request from {} ({}): {}", addr, peer_name, reason);
+                        let has_llm = is_ollama_available().await;
+                        if has_llm {
+                            // Use the local bind IP of this TCP socket so the peer can reach us
+                            let lan_ip = local_ip.clone();
+                            let resp = Message::LLMAccessResponse {
+                                granted: true,
+                                message: "Access granted".to_string(),
+                                llm_host: Some(lan_ip),
+                                llm_port: Some(8080),
+                            };
+                            if let Err(e) = resp.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access response to {}: {}", addr, e);
                             }
                         } else {
-                            println!("TCP: LLM access denied by {} - {}", addr, message);
+                            let resp = Message::LLMAccessResponse {
+                                granted: false,
+                                message: "LLM not available".to_string(),
+                                llm_host: None,
+                                llm_port: None,
+                            };
+                            if let Err(e) = resp.send(&mut stream).await {
+                                eprintln!("TCP: Failed to send LLM access denial to {}: {}", addr, e);
+                            }
                         }
                     }
-                    _ => {
-                        println!("TCP: Received unexpected message type from {}", addr);
+                    Message::FileMeta { filename, file_type, file_size, sha256_hex: _, uploaded_at, hmac_hex: _ } => {
+                        // Store announced peer file so UI can show immediately
+                        let ts = match chrono::DateTime::parse_from_rfc3339(&uploaded_at) {
+                            Ok(dt) => dt.with_timezone(&chrono::Utc),
+                            Err(_) => chrono::Utc::now(),
+                        };
+                        let info = FileInfo {
+                            filename: filename.clone(),
+                            file_type: file_type.clone(),
+                            file_size: file_size,
+                            uploader_ip: addr.ip().to_string(),
+                            upload_time: ts,
+                        };
+                        add_announced_file(info).await;
                     }
+                    Message::FileTransfer { filename, file_type, file_size: _, content } => {
+                        // Save received binary content to peer dir
+                        let out_path = peer_dir.join(&filename);
+                        if let Err(e) = fs::write(&out_path, &content).await {
+                            eprintln!("TCP: Failed to save received binary {} from {}: {}", filename, addr, e);
+                        } else {
+                            println!("TCP: Saved received binary {} from {}", filename, addr);
+                            // Ensure it appears in /api/files immediately even if FILE_META was missed
+                            let info = FileInfo {
+                                filename: filename.clone(),
+                                file_type: file_type.clone(),
+                                file_size: content.len() as u64,
+                                uploader_ip: addr.ip().to_string(),
+                                upload_time: chrono::Utc::now(),
+                            };
+                            add_announced_file(info).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(None) => {
                 println!("TCP: Connection closed by {}", addr);
+                let mut map = ACTIVE_STREAMS.lock().await;
+                map.remove(&addr.ip().to_string());
                 break;
             }
             Err(e) => {
                 eprintln!("TCP: Error reading from {}: {}", addr, e);
-                return Err(e);
+                let mut map = ACTIVE_STREAMS.lock().await;
+                map.remove(&addr.ip().to_string());
+                break;
             }
         }
     }
@@ -638,9 +852,75 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                         }
                     }
 
+                    // Register a dedicated writable stream for broadcasts by cloning the std socket
+                    let std_socket = match stream.into_std() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to get std socket for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+
+                    // One clone for periodic sharing, one for main handler, one for broadcasting
+                    let share_socket = match std_socket.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to clone share socket for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+                    let handler_socket = match std_socket.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to clone handler socket for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+                    let broadcast_socket = match std_socket.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to clone broadcast socket for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+
+                    let mut stream = match TcpStream::from_std(handler_socket) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to make tokio handler stream for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+                    let share_stream = match TcpStream::from_std(share_socket) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("TCP: Failed to make tokio share stream for {}: {}", addr, e);
+                            let mut connected = CONNECTED_PEERS.lock().await;
+                            connected.remove(&ip);
+                            continue;
+                        }
+                    };
+                    match TcpStream::from_std(broadcast_socket) {
+                        Ok(bstream) => {
+                            let mut map = ACTIVE_STREAMS.lock().await;
+                            map.insert(ip.clone(), bstream);
+                        }
+                        Err(e) => eprintln!("TCP: Failed to make tokio broadcast stream for {}: {}", addr, e),
+                    }
+
                     // Set up periodic sharing
-                    match setup_periodic_sharing(stream, &addr, &ip).await {
-                        Ok((mut stream, share_handle)) => {
+                    match setup_periodic_sharing(share_stream, &addr, &ip).await {
+                        Ok((mut _unused, share_handle)) => {
                             // Keep connection alive and handle messages
                             loop {
                                 match Message::receive(&mut stream).await {
@@ -699,6 +979,30 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                                                     println!("TCP: LLM access denied by {} - {}", addr, message);
                                                 }
                                             }
+                                            Message::FileMeta { filename, file_type, file_size, sha256_hex: _, uploaded_at, hmac_hex: _ } => {
+                                                // Record announced peer file to show in UI immediately
+                                                let ts = match chrono::DateTime::parse_from_rfc3339(&uploaded_at) {
+                                                    Ok(dt) => dt.with_timezone(&chrono::Utc),
+                                                    Err(_) => chrono::Utc::now(),
+                                                };
+                                                let info = FileInfo {
+                                                    filename: filename.clone(),
+                                                    file_type: file_type.clone(),
+                                                    file_size: file_size,
+                                                    uploader_ip: ip.clone(),
+                                                    upload_time: ts,
+                                                };
+                                                add_announced_file(info).await;
+                                            }
+                                            Message::FileTransfer { filename, file_type: _, file_size: _, content } => {
+                                                // Save received binary into peer_dir
+                                                let out_path = peer_dir.join(&filename);
+                                                if let Err(e) = fs::write(&out_path, &content).await {
+                                                    eprintln!("TCP: Failed to save received binary {} from {}: {}", filename, addr, e);
+                                                } else {
+                                                    println!("TCP: Saved received binary {} from {}", filename, addr);
+                                                }
+                                            }
                                             _ => continue,
                                         }
                                     }
@@ -706,12 +1010,16 @@ pub async fn connect_to_peers(received_ips: Arc<Mutex<HashSet<String>>>) {
                                         println!("TCP: Connection closed by {}", addr);
                                         let mut connected = CONNECTED_PEERS.lock().await;
                                         connected.remove(&ip);
+                                        let mut map = ACTIVE_STREAMS.lock().await;
+                                        map.remove(&ip);
                                         break;
                                     }
                                     Err(e) => {
                                         eprintln!("TCP: Error reading from {}: {}", addr, e);
                                         let mut connected = CONNECTED_PEERS.lock().await;
                                         connected.remove(&ip);
+                                        let mut map = ACTIVE_STREAMS.lock().await;
+                                        map.remove(&ip);
                                         break;
                                     }
                                 }
@@ -803,7 +1111,7 @@ async fn setup_periodic_sharing(
     Ok((stream, share_handle))
 }
 
-async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Result<bool> {
+async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Result<()> {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "Unknown".to_string());
@@ -830,52 +1138,7 @@ async fn request_llm_access(stream: &mut TcpStream, addr: &str) -> std::io::Resu
         }
     }
 
-    // Wait for response with a single longer timeout
-    let timeout = Duration::from_secs(15);
-    
-    match tokio::time::timeout(timeout, async {
-        loop {
-            match Message::receive(stream).await? {
-                Some(Message::LLMAccessResponse { granted, message, llm_host, llm_port }) => {
-                    return Ok((granted, message, llm_host, llm_port));
-                }
-                Some(other) => {
-                    println!("TCP: Received unexpected message while waiting for LLM access response: {:?}", other);
-                    // Continue waiting for the correct response
-                    continue;
-                }
-                None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed")),
-            }
-        }
-    }).await {
-        Ok(Ok((granted, message, llm_host, llm_port))) => {
-            if granted {
-                println!("TCP: LLM access granted by {} - {}", addr, message);
-                let mut authorized = AUTHORIZED_PEERS.lock().await;
-                authorized.insert(addr.to_string());
-                
-                // Store LLM connection details if provided
-                if let (Some(host), Some(port)) = (llm_host, llm_port) {
-                    let mut connections = LLM_CONNECTIONS.lock().await;
-                    connections.insert(addr.to_string(), (host.clone(), port));
-                    println!("TCP: LLM connection details stored for {} ({}:{})", addr, host, port);
-                }
-                Ok(true)
-            } else {
-                println!("TCP: LLM access denied by {} - {}", addr, message);
-                Ok(false)
-            }
-        }
-        Ok(Err(e)) => {
-            eprintln!("TCP: Error reading LLM access response from {}: {}", addr, e);
-            Err(e)
-        }
-        Err(_) => {
-            eprintln!("TCP: Timeout waiting for LLM access response from {}", addr);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Timeout waiting for LLM access response"
-            ))
-        }
-    }
-} 
+    // Do not wait here; the main receive loop will capture LLMAccessResponse and store it.
+    Ok(())
+}
+ 
